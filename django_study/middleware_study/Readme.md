@@ -33,6 +33,7 @@ def simple_middleware(get_response):
 ```
 ### Class call
 - 조금 더 디테일하게 만질 수 있음
+- MiddlewareMixin을 상속받으면 예전버전이랑 스무스하게 연결할 수 있음
 ```python
 class SimpleMiddleware:
     #서버 돌 때 최초 초기화 한 번
@@ -40,6 +41,7 @@ class SimpleMiddleware:
         self.get_response = get_response
     
     # request 올 때마다 계에에ㅔㅇ속
+    # 웬만하면 쓸 일 없음 장고가 process_request(), process_response() 를 바로 호출해버리기 땜시롱
     def __call__(self, request):
         # view에 들어가기 전(혹은 다음 미들웨어) 각각의 request에 대하여 동작할 코드를 여기에
         
