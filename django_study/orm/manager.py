@@ -1,6 +1,7 @@
 # https://docs.djangoproject.com/en/4.0/topics/db/managers/
 # Manager클래스는 DB쿼리 작업이 장고 모델에게 제공되는 Interface이다.
 # 장고의 모든 모델에게는 적어도 하나의 매니저가 존재한다.
+# 그래서 별도의 추가없이도 QuerySet을 사용할 수 있다
 
 
 
@@ -45,7 +46,8 @@ class Response(models.Model):
     poll = models.ForeignKey(OpinionPoll, on_delete=models.CASCADE)
 
 
-# 위 예제에서는 OpinionPoll.objects.with_counts()을 사용하여 
+OpinionPoll.objects.with_counts()
+# 위 예제에서는 PollManager를 사용하여
 # num_responses 속성이 들어있는 OpinionPoll 객체의 QuerySet을 가져올 수 있다.
 
 # custom Manager메서드는 QuerySet뿐만 아니라 원하는건 뭐든지 반환할 수 있다.
@@ -61,11 +63,31 @@ class Book(models.Model):
     author = models.CharField(max_length=50)
 
 # Book.objects.all()은 데이터베이스의 모든 book들을 반환할 것이다.
-# 이러한 Manager의 기본 QuerySet은 Manager.get_queryset() 메서드를 오버라이딩해서 오버라이드할 수 있다.
+# Manager.get_queryset() 메서드를 오버라이딩해서 Manager의 기본 QuerySet인 요런 것들을 오버라이드할 수 있다.
 
 # get_queryset()은 필요한 속성들과 함께 QuerySet을 반환할 것이다.
 # 예를 들면, 다음과 같다.
+# 아래의 모델은 두 메서드가 있다. 하나는 모든 객체들을 반환하고 다른건 Roald Dahl이 쓴 객체만 반환할 것이다.
 
+class DahlBookManager(models.Manager):
+    def get_queryset(self):
+        return super().get_queryset().filter(author='Roald Dahl')
+
+class Book(models.Model):
+    title = models.CharField(max_length=100)
+    author = models.CharField(max_length=50)
+
+    objects = models.Manager()  # default 매니저
+    dahl_objects = DahlBookManager  # Dahl을 위한 매니저
+
+
+Book.objects.all()
+Book.dahl_objects.all()
+
+
+# 이러한 예제를 통해서 같은 모델에 여러개의 매니저들을 사용할 수 있다.
+
+# 요런 것들을 응용해서 중복되지않는 filter를 잘 할 수 있겠지용
 class AuthorManager(models.Manager):
     def get_queryset(self):
         return super().get_queryset().filter(role='A')
@@ -79,5 +101,28 @@ class Person(models.Model):
     last_name = models.CharField(max_length=50)
     role = models.CharField(max_length=1, choices=[('A', _('Author')), ('E', _('Editor'))])
     people = models.Manager()
-    author = AuthorManager()
-    editor = EditorManager()
+    authors = AuthorManager()
+    editors = EditorManager()
+
+Person.authors.all()
+Person.editors.all()
+Person.people.all()
+
+
+# 3.Default Managers
+Model._default_manager
+
+# 커스텀 Manager 객체를 사용한다믄, 첫번째 Manager Django가 특별한 상태를 갖는다는걸 알아둬야한다.
+# Django는 첫번째 Manager를 default 매니저로 정의한다. 그리고 Django는 해당 모델에 대해서 딱 그 Manager를 사용한다.
+
+Meta.default_manager_name # 으로 커스텀 default manager를 지정할 수 있다.
+# 어떤 모델이 있는데 모르는 모델이다싶으면(generic view를 가지고 있는 써드파티 앱같은거)
+# objects manager가 있겠거니 하지말고 걍 저 매니저로 지정하자.(아니면 _base_manager)
+
+
+# 4. Base managers
+Model._base_manager
+
+# 4-1. Using managers for related object access
+# 장고는 기본적으로 관련 객체에 접근할 때(choice.question 같은거) Model._base_manager의 인스턴스를 이용한다. _default_manager가 아님!
+# 왜냐하면 기본적으로 default_manager가 filter해서 접근할 수 없는 관련 객체라도 장고가 검색할 수 있어야 되기때문임.
