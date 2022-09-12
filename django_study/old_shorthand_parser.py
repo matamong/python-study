@@ -63,7 +63,7 @@ class ShorthandParser(object):
     #_FIRST_VALUE = _NamedRegex('first', ur'[\!\#-&\(-\+\--\<\>-Z\\-z\u007c-\uffff]' ur'[\!\#-&\(-\+\--\\\^-\uffff]*')
     #_SECOND_VALUE = _NamedRegex('second', ur'[\!\#-&\(-\+\--\<\>-Z\\-z\u007c-\uffff]' ur'[\!\#-&\(-\+\--\<\>-\uffff]*')
     # python 3.x부터 ur 안 씀
-    _FIRST_VALUE = _NamedRegex('first', r'[\!\#-&\(-\+\--\<\>-Z\\-z\u007c-\uffff]' r'[\!\#-&\(-\+\--\\\^-\uffff]*')
+    _FIRST_VALUE = _NamedRegex('first', r'[\!\#-&\(-\+\--\<\>-Z\\-z\u007c-\uffff]' r'[\!\#-&\(-\+\--\\\^-\|~-\uffff]*')
     _SECOND_VALUE = _NamedRegex('second', r'[\!\#-&\(-\+\--\<\>-Z\\-z\u007c-\uffff]' r'[\!\#-&\(-\+\--\<\>-\uffff]*')
 
     def __init__(self):
@@ -155,6 +155,14 @@ class ShorthandParser(object):
         self._consume_whitespace()
         values = []
         while self._current() != ']':
+            """
+            여기서 그들은 이걸 바꿔도 되는지 망설였따. 왜냐믄 nested list/hashes를 지원하고 싶었었나봄
+            여기는 string 리스트를 파싱하는디 nested lists/hashes를 지원하려는 경우 동작이 변경되기 때문임. 
+            원래는 foo=[{a=b},{c=d}]를 
+            {'foo':['{a=b}', '{c=d}']}로 바꿨다면 이제
+            {'foo': [{'a': 'b'}, {'c': 'd'}]} 이렇게 바뀔 것임
+            지금은 이전 동작이 유지되게끔함.
+            """
             val = self._value()
             values.append(val)
             self._consume_whitespace()
@@ -165,7 +173,28 @@ class ShorthandParser(object):
         return values
 
     def _hash_literal(self):
-        raise NotImplementedError("_hash_literal 오오올 이렇게 구현 안된거 에러낼 수 있구만")
+        self._expect('{')
+        self._consume_whitespace()
+        keyvals = {}
+        while self._current() != '}':
+            key = self._key()
+            self._consume_whitespace()
+            self._expect('=')
+            self._consume_whitespace()
+            if self._current() == '[':
+                v = self._explicit_list()
+            elif self._current() == '{':
+                v = self._explicit_list()
+            else:
+                # 아닐 경우에는 스칼라값
+                v = self._first_value()
+            self._consume_whitespace()
+            if self._current() != '}':
+                self._expect(',')
+                self._consume_whitespace()
+            keyvals[key] = v
+        self._expect('}')
+        return keyvals
 
     def _first_value(self):
         # first-value = value / single-quoted-val / double-quoted-val
