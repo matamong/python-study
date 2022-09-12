@@ -60,11 +60,11 @@ class ShorthandParseError(Exception):
 class ShorthandParser(object):
     _SINGLE_QUOTED = _NamedRegex('singled quoted', r'\'(?:\\\\|\\\'|[^\'])*\'')   # ' <- single quote로 감싸져있는 것
     _DOUBLE_QUOTED = _NamedRegex('double quoted', r'"(?:\\\\|\\"|[^"])*"')    # " <- double quote로 감싸져있는 것
-    #_FIRST_VALUE = _NamedRegex('first', ur'[\!\#-&\(-\+\--\<\>-Z\\-z\u007c-\uffff]' ur'[\!\#-&\(-\+\--\\\^-\uffff]*')
-    #_SECOND_VALUE = _NamedRegex('second', ur'[\!\#-&\(-\+\--\<\>-Z\\-z\u007c-\uffff]' ur'[\!\#-&\(-\+\--\<\>-\uffff]*')
     # python 3.x부터 ur 안 씀
-    _FIRST_VALUE = _NamedRegex('first', r'[\!\#-&\(-\+\--\<\>-Z\\-z\u007c-\uffff]' r'[\!\#-&\(-\+\--\\\^-\|~-\uffff]*')
-    _SECOND_VALUE = _NamedRegex('second', r'[\!\#-&\(-\+\--\<\>-Z\\-z\u007c-\uffff]' r'[\!\#-&\(-\+\--\<\>-\uffff]*')
+    _FIRST_VALUE = _NamedRegex('first', u'[\!\#-&\(-\+\--\<\>-Z\\\\-z\u007c-\uffff]'
+                               u'[\!\#-&\(-\+\--\\\\\^-\|~-\uffff]*')
+    _SECOND_VALUE = _NamedRegex('second', u'[\!\#-&\(-\+\--\<\>-Z\\\\-z\u007c-\uffff]'
+                                u'[\!\#-&\(-\+\--\<\>-\uffff]*')
 
     def __init__(self):
         self._tokens = []
