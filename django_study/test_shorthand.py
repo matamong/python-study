@@ -1,6 +1,6 @@
-import shorthand_parser
 import unittest
-from shorthand_parser import ShorthandParser
+# from shorthand_parser import ShorthandParser
+from old_shorthand_parser import ShorthandParser
 
 # unittest로 변경해보기
 # https://docs.python.org/ko/3/library/unittest.html
@@ -39,5 +39,6 @@ class TestShorthandParser(unittest.TestCase):
            {'foo': 'a space', 'bar': 'a space', 'baz': 'a space'})
 
     def can_parse(self, data, expected):
+        # actual = ShorthandParser().parse(data)
         actual = ShorthandParser().parse(data)
         self.assertEqual(actual, expected)

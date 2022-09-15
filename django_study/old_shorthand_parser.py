@@ -48,12 +48,17 @@ class ShorthandParseError(Exception):
         super(ShorthandParseError, self).__init__(msg)
 
     def _construct_msg(self):
+        if '\n' in self.value:
+            last_newline = self.value[:self.index].rindex('\n')
+            num_spaces = self.index - last_newline - 1
+        else:
+            num_spaces = self.index
         msg = (
             "Expected: '%s', received: '%s' for input:\n"
             "%s\n"
             "%s\n"
         ) % (self.expected, self.actual, self.value,
-             ' ' * self.index + '^')
+             ' ' * num_spaces + '^')
         return msg
 
 
@@ -144,7 +149,7 @@ class ShorthandParser(object):
             return first_value
         return csv_list
 
-    def value(self):
+    def _value(self):
         result = self._FIRST_VALUE.match(self._input_value[self._index:])
         if result is not None:
             return self._consume_matched_regex(result)
@@ -229,7 +234,7 @@ class ShorthandParser(object):
         self._index += 1    # index를 왜 1 올리징
 
     def _must_consume_regex(self, regex):
-        result = regex.match(self._input_value[self.index:])
+        result = regex.match(self._input_value[self._index:])
         if result is not None:
             return self._consume_matched_regex(result)
         raise ShorthandParseError(self._input_value, '<%s>' % regex.name, '<none>', self._index)
