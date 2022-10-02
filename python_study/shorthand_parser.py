@@ -11,6 +11,12 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 
+
+# 오픈소스인 AWS CLI - Shorthand Parser 코드를 뜯어보고 따라치면서 공부
+# https://github.com/aws/aws-cli/blob/2f09fcc0e28784affb472d9aa0d3dd2c3ab513de/awscli/shorthand.py#L116-L384
+#
+#
+
 import re
 import string
 
