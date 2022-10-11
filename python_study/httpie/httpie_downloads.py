@@ -1,9 +1,21 @@
 import threading
 from typing import IO   # typing: 타입 힌트를 지원. 효력은 없음.
 from time import sleep, time
+from httpie_downloads_utils import *
 
 # HTTPie - Reporting Download Progress 오픈소스를 뜯어보고 따라치면서 공부
 # https://github.com/httpie/httpie/blob/64c31d554a367abf876bd355f07dca6e41476c3f/httpie/downloads.py#L369-L480
+
+CLEAR_LINE = '\r\033[K'
+PROGRESS = (
+    '{percentage: 6.2f} %'
+    ' {downloaded: >10}'
+    ' {speed: >10}/s'
+    ' {eta: >8} ETA'
+)
+PROGRESS_NO_CONTENT_LENGTH = '{downloaded: >10} {speed: >10}/s'
+SUMMARY = 'Done. {downloaded} in {time:0.5f}s ({speed}/s)\n'
+SPINNER = '|/-\\'
 
 
 class DownloadStatus:
@@ -81,7 +93,7 @@ class ProgressReporterThread(threading.Thread):
 
             if not self.status.total_size:
                 self._status_line = PROGRESS_NO_CONTENT_LENGTH.format(
-                    downloaded=humansize_bytes(downloaded),
+                    downloaded=humanize_bytes(downloaded),
                     speed=humanize_bytes(speed),
                 )
             else:
@@ -101,7 +113,7 @@ class ProgressReporterThread(threading.Thread):
 
                 self._status_line = PROGRESS.format(
                     percentage=percentage,
-                    downloaded=humansize_bytes(downloaded),
+                    downloaded=humanize_bytes(downloaded),
                     speed=humanize_bytes(speed),
                     eta=eta,
                 )
@@ -133,3 +145,8 @@ class ProgressReporterThread(threading.Thread):
             time=time_taken,
         ))
         self.output.flush()
+
+
+if __name__ == '__main__':
+    thread = ProgressReporterThread()
+    print(thread.status())
