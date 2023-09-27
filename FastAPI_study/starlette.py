@@ -1,5 +1,8 @@
+import functools
+from tkinter import SE
 import typing
 from fastapi import WebSocket
+from fastapi.concurrency import run_in_threadpool
 
 from fastapi.responses import PlainTextResponse 
 
@@ -131,3 +134,129 @@ class BaseRoute:
         
         scope.update(child_scope)
         await self.handle(scope, receive, send)
+
+
+####################
+# 이 밑으로 BaseRoute를 상속받는 Route에 대한 공부
+####################
+
+# inspect module은 함수, 클래스, 메서드 등의 속성 및 구조를 동적으로 검사하고 분석한다.
+# 동적이란 말은 실행 중에 검사할 수 있다는 뜻이다.
+import inspect
+
+from starlette.types import ASGIApp
+from starlette._utils import is_async_callable
+from starlette.requests import Request
+
+def get_name(endpoint: typing.Callable) -> str:
+    """
+    endpoint가 클래스인지 함수인지에 따라 이름을 반환한다.
+
+    params:
+        endpoint: 라우트의 endpoint로 사용되는 함수 또는 클래스 (Callable 타입)
+    
+    return:
+        str: endpoint의 이름
+    """
+    if inspect.isfunction(endpoint) or inspect.isclass(endpoint):
+        return endpoint.__name__
+    return endpoint.__class__.__name__
+
+
+def request_response(func: typing.Callable) -> ASGIApp:
+    """
+    함수나 코루틴을 받아서 ASGI 애플리케이션을 반환한다.
+    """
+    is_coroutine = is_async_callable(func)
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        """
+        Closure 함수로서, ASGI 애플리케이션을 반환한다.
+        Closure, 함수 내부에 정의된 함수를 의미한다.
+        함수 외부에서 직접 호출할 수 없고, 함수 내부에서만 호출할 수 있다.
+        호출할 때는, 외부 함수의 반환값을 변수에 할당하고, 그 변수를 함수처럼 호출한다.
+        예를 들어,
+            def outer_func():
+                def inner_func():
+                    print("Hello, world!")
+                return inner_func
+
+            outer_func()()
+            >>> Hello, world!
+
+        이러한 Closure함수를 이용하는 주된 이유는, 함수 내부의 함수를 외부에서 접근할 수 없게 하기 위해서이다.
+        콜백이나 데이터 은닉 등등에 이용된다.
+        """
+        request = Request(scope, receive=receive, send=send)
+        if is_coroutine:
+            # func가 코루틴인 경우 직접 호출
+            response = await func(request)
+        else:
+            # func가 동기 함수인 경우 스레드 풀에서 실행
+            """
+            동기 함수를 스레드 풀에서 실행하는 이유는,
+            동기 함수가 블로킹되면 ASGI 애플리케이션의 이벤트 루프가 블로킹될 수 있는데,
+            이 때 스레드 풀을 사용하여 별도의 스레드에서 처리할 수 있게 할 수 있기 때문이다.
+            """
+            response = await run_in_threadpool(func, request)
+        
+        # 요청을 처리한 결과를 ASGI 애플리케이션으로 응답 전송
+        await response(scope, receive, send)
+    
+    return app
+
+class Route(BaseRoute):
+    def __init__(
+        self,
+        path: str,
+        endpoint: typing.Callable,
+        *,
+        methods: typing.Sequence[str] = None,
+        name: typing.Optional[str] = None,
+        include_in_schema: bool = True,
+    ) -> None:
+        
+        # python에서 assert는 False일 경우 AssertionError를 발생시킨다.
+        # [assert 조건, 에러메시지] 형식으로 사용한다. 유용한듯
+        assert path.startswith("/"), "Routed paths must always start with '/'"
+
+        self.path = path
+        self.endpoint = endpoint
+        self.name = get_name(endpoint) if name is None else name
+        self.include_in_schema = include_in_schema # 스키마에 포함할지 여부
+
+
+        endpoint_handler = endpoint
+
+        """
+        만약, endpoint_handler가 function.partial로 감싸진 함수라면, 
+        while을 사용해서 일반 함수가 될 때까지 partial 함수를 깐다.
+
+        functools.partial은 함수를 부분적으로 실행시키는 함수이다.
+        함수의 일부인자를 고정시키고, 나머지 인자를 호출시에 넣어서 실행시킬 수 있다.
+        예를 들면, 
+            def add(a, b):
+                return a + b
+            
+            add_1 = functools.partial(add, 1)
+            add_1(2)
+            >>> 3
+        """
+        while isinstance(endpoint_handler, functools.partial):
+            endpoint_handler = endpoint_handler.func
+
+
+        """
+        endpoint_handler는 비동기 함수 또는 메서드라면,
+        ASGI 애플리케이션을 생성하고 self.app에 할당한다.
+        아니라면 endpoint 그대로 self.app에 할당한다.
+        """
+        if inspect.isfunction(endpoint_handler) or inspect.ismethod(endpoint_handler):
+            self.app = request_response(endpoint)
+            if methods is None:
+                methods = ["GET"]
+        else:
+            # Endpoint가 클래스일 때. ASGI로 다룬다.
+            self.app = endpoint
+        
+        
