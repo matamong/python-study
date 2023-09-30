@@ -1,7 +1,8 @@
 import functools
 from tkinter import SE
 import typing
-from fastapi import WebSocket
+from urllib import response
+from fastapi import HTTPException, WebSocket
 from fastapi.concurrency import run_in_threadpool
 
 from fastapi.responses import PlainTextResponse 
@@ -148,6 +149,20 @@ from starlette.types import ASGIApp
 from starlette._utils import is_async_callable
 from starlette.requests import Request
 
+
+def NoMatchFound(Exception):
+    """
+    `.url_for(name, **path_params)`, `url_path_for(name, **path_params)`에 의해서 일어나며,
+    맞는 route가 없을 때 발생한다.
+
+    대체로 Exception의 경우 모듈 맨 위에 있어야하는거 잊지말기ㅣㅣ 여기선 공부용이니껜 여기 둠!
+    """
+
+    def __init__(self, name: str, path_params: typing.Dict[str, typing.Any]) -> None:
+        params = ",".join(list(path_params.keys()))
+        super().__init__(f'No route exists for name "{name}" and params "{params}".')
+
+
 def get_name(endpoint: typing.Callable) -> str:
     """
     endpoint가 클래스인지 함수인지에 따라 이름을 반환한다.
@@ -161,6 +176,31 @@ def get_name(endpoint: typing.Callable) -> str:
     if inspect.isfunction(endpoint) or inspect.isclass(endpoint):
         return endpoint.__name__
     return endpoint.__class__.__name__
+
+
+def replace_params(
+        path: str,
+        param_convertors: typing.Dict[str, Convertor],
+        path_params: typing.Dict[str, str],
+) -> typing.Tuple[str, dict]:
+    """
+    경로에 있는 파라미터 플레이스홀더를 실제 값으로 대체하고 대체된 경로와 업데이트된 파라미터 딕셔너리를 반환.
+
+    params:
+        path: 경로 문자열
+        param_convertors: 파라미터의 이름과 파라미터 변환기를 매핑한 딕셔너리
+        path_params: 경로 파라미터를 담고 있는 딕셔너리
+    
+    return:
+        Tuple[str, dict]: 대체된 경로와 업데이트된 파라미터 딕셔너리
+    """
+    for key, value in list(path.parmas.items()):
+        if "{" + key + "}" in path:
+            convertor = param_convertors[key]
+            value = convertor.to_string(value)
+            path = path.replace("{" + key + "}", value)
+            path_params.pop(key)
+    return path, path_params
 
 
 def request_response(func: typing.Callable) -> ASGIApp:
@@ -204,6 +244,24 @@ def request_response(func: typing.Callable) -> ASGIApp:
         await response(scope, receive, send)
     
     return app
+
+def websocket_session(func: typing.Callable) -> ASGIApp:
+    """
+    `func(session)` 코루틴을 받아서 ASGI 애플리케이션을 반환한다.
+    """
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        """
+        ASGI 애플리케이션 함수.
+        
+        Args:
+            scope (Scope): ASGI 요청 스코프.
+            receive (Receive): 메시지 수신을 위한 함수.
+            send (Send): 메시지 전송을 위한 함수.
+        """
+        session = WebSocket(scope, receive=receive, send=send)
+        await func(session)
+    return app
+
 
 class Route(BaseRoute):
     def __init__(
@@ -258,5 +316,121 @@ class Route(BaseRoute):
         else:
             # Endpoint가 클래스일 때. ASGI로 다룬다.
             self.app = endpoint
-        
-        
+
+        if methods is None:
+            self.methods = None
+        else:
+            self.methods = {method.upper() for method in methods}
+            if "GET" in self.methods:
+                self.methods.add("HEAD")
+
+        self.path_regex, self.path_format, self.param_convertors = compile_path(path)
+    
+
+    def matches(self, scope: Scope) -> typing.Tuple[Match, Scope]:
+        if scope["type"] == "http":
+            match = self.path_regex.match(scope["path"])
+            if match:
+                matched_params = match.groupdict()
+                for key, value in matched_params.items():
+                    matched_params[key] = self.param_convertors[key].convertor(value) 
+                path_params = dict(scope.get("path_params", {})) # dictionary의 원하는 데이터를 안전하게 불러올 수 있음 오 굿굿
+                path_params.update(matched_params)
+                child_scope = {"endpoint": self.endpoint, "path_params": path_params}
+                if self.methods and scope["method"] not in self.methods:
+                    return Match.PARTIAL, child_scope
+                else:
+                    return Match.FULL, child_scope
+        return Match.NONE, {}
+
+
+    def url_path_for(self, __name: str, **path_params: typing.Any) -> URLPath:
+        """
+        라우트의 URL 경로를 생성한다.
+        """
+        seen_params = set(path_params.keys())
+        expected_params = set(self.param_convertors.keys())
+
+        if __name != self.name or seen_params != expected_params:
+            raise NoMatchFound(__name, path_params)
+
+        path, remaining_params = replace_params(
+            self.path_format, self.param_convertors, path_params
+        )
+        assert not remaining_params
+        return URLPath(path=path, protocol="http")
+    
+
+    async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """
+        ASGI 요청을 처리한다. 그래서 코루틴이다.
+        """
+        if self.methods and scope["method"] not in self.methods:
+            headers = {"Allow": ", ".join(self.methods)}
+            if "app" in scope:
+                raise HTTPException(status_code=405, headers=headers)
+            else:
+                response = PlainTextResponse(
+                    "Method Not Allowed", status_code=405, headers=headers
+                )
+            await response(scope, receive, send)
+        else:
+            await self.app(scope, receive, send)
+    
+
+    def __eq__(self, other: typing.Any) -> bool:
+        return(
+            isinstance(other, Route)
+            and self.path == other.path
+            and self.endpoint == other.endpoint
+            and self.methods == other.methods
+        )
+
+
+    def __repr__(self) -> str:
+        class_name = self.__class__.__name__
+        methods = sorted(self.methods or [])
+        path, name = self.path, self.name
+        return f"{class_name}(path={path!r}, name={name!r}, methods={methods!r})" 
+    
+
+
+class WebSocketRoute(BaseRoute):
+    """
+    비슷해서 패스
+    """
+    pass
+
+
+class Mount(BaseRoute):
+    def __init__(
+        self,
+        path: str,
+        app: typing.Optional[ASGIApp] = None,
+        routes: typing.Optional[typing.Sequence[BaseRoute]] = None,
+        name: typing.Optional[str] = None,
+        *,
+        middleware: typing.Optional[typing.Sequence[Middleware]] = None,
+    ) -> None:
+        assert path == "" or path.startswith("/"), "Routed paths must always start with '/'"
+        assert(
+            app is not None or routes is not None
+        ), "Either an 'app' or 'routes' must be provided."
+        self.path = path.rstrip("/")
+        if app is not None:
+            self._base_app: ASGIApp = app
+        else:
+            self._base_app = Router(routes=routes)
+        self.app = self._base_app
+        if middleware is not None:
+            for cls, options in reversed(middleware):
+                """
+                미들웨어는 순서가 중요하다.
+                그러므로 여기서 미들웨어를 역순으로 stack에 쌓는다.
+                그래서 맨 마지막에 쌓인 미들웨어가 가장 먼저 실행된다.
+                """
+                self.app = cls(self.app, **options)
+        self.name = name
+        self.path_regex, self.path_format, self.param_convertors = compile_path(
+            self.path + "/{path:path}"
+        )
