@@ -59,6 +59,8 @@ class BaseRoute:
 
     def matches(self, scope: Scope) -> typing.Tuple[Match, Scope]:
         """
+        요약: ASGI 요청과 현재 Route의 경로를 일치시키고, 일치한 경우에 대한 정보를 반환
+        
         라우트가 scope와 일치하는지 확인한다.
         Scope는 웹 프레임워크에서 사용되는 용어로,
         request, response과 관련된 정보를 포함하는 dicrioanry이다.
@@ -144,6 +146,7 @@ class BaseRoute:
 # inspect module은 함수, 클래스, 메서드 등의 속성 및 구조를 동적으로 검사하고 분석한다.
 # 동적이란 말은 실행 중에 검사할 수 있다는 뜻이다.
 import inspect
+import contextlib
 
 from starlette.types import ASGIApp
 from starlette._utils import is_async_callable
@@ -403,6 +406,11 @@ class WebSocketRoute(BaseRoute):
 
 
 class Mount(BaseRoute):
+    """
+    path와 해당 경로에 연결된 app 또는 route 설정,
+    middleware 적용
+    """
+
     def __init__(
         self,
         path: str,
@@ -434,3 +442,110 @@ class Mount(BaseRoute):
         self.path_regex, self.path_format, self.param_convertors = compile_path(
             self.path + "/{path:path}"
         )
+
+    
+    @property # 읽기 전용 속성을 만들 때 사용한다. 함수를 속성처럼 사용할 수 있다. 이 말인 즉슨, 함수를 호출할 때 ()를 붙이지 않아도 된다는 뜻이다.
+    def routes(self) -> typing.List[BaseRoute]:
+        return getattr(self._base_app, "routes", [])
+    
+
+    def matches(self, scope: Scope) -> typing.Tuple[Match, Scope]:
+        if scope["type"] in ("http", "websocket"):
+            path = scope["path"]
+            match = self.path_regex.match(path)
+            if match:
+                
+                """
+                path를 정규식과 비교하여 일치하는 경우,
+                정규식 패턴에 의해 일치된 그룹들을 딕셔너리로 가져오는 부분
+                self.path_regex 패턴에 정의된 경로에 다음과 같은 그룹들이 있다고 가정하자.
+                    {user:str}
+                    {post_id:int}
+                    {category:str}
+                
+                주어진 path 문자열이 '/matamong/123/backend' 라면, matched_params는 다음과 같다.
+                    "user": "john" (str 그룹)
+                    "post_id": "123" (int 그룹)
+                    "category": "tech" (str 그룹)
+                
+                """
+                matched_params = match.groupdict()
+
+
+                for key, value in matched_params.items():
+                    matched_params[key] = self.param_convertors[key].converter(value)  # 경로의 각 매개변수를 해당하는 변환기를 사용하여 변환
+                remaining_path = "/" + matched_params.pop("path") # 남은 경로를 가져오고, "path" 매개변수는 따로 처리 eg. /api/users/{path:path}
+                matched_path = path[: -len(remaining_path)] # 일치하는 경로를 추출
+                path_parmas = dict(scope.get("path_parmas", {}))
+                path_parmas.update(matched_params) # 경로 매개변수를 업데이트
+                root_path = scope.get("root_path", "")
+
+                # 새로운 스코프를 생성하여 경로 매개변수 및 경로 정보를 전달
+                child_scope = {
+                    "path_params": path_parmas,
+                    "app_root_path": scope.get("app_root_path", root_path),
+                    "root_path": root_path + matched_path,
+                    "path": remaining_path,
+                    "endpoint": self.app,
+                }
+                return Match.FULL, child_scope
+            return Match.NONE, {}
+ 
+ # 이하 다 비슷해서 생략
+
+
+"""
+PEP에서는 TypeVar를 사용할 때 _T, _U, _V 등의 이름을 사용하라고 권장한다.
+만약 인자가 있는 경우에는 그냥 사용해도 된다.
+
+eg.
+  _T = TypeVar("_T")
+  _P = ParamSpec("_P")
+  AddableType = TypeVar("AddableType", int, float, str)
+  AnyFunction = TypeVar("AnyFunction", bound=Callable)
+"""
+_T = typing.TypeVar("_T")
+
+
+class _AsyncLiftContextManager(typing.AsyncContextManager[_T]):
+    """
+    비동기 컨텍스트 매니저를 동기 컨텍스트 매니저로 변환하는 wrapper 클래스
+    동기와 비동기 컨텍스트 매니저의 호환성을 위해서 사용.
+    """
+    def __init__(self, cm: typing.ContextManager[_T]):
+        self._cm = cm
+    
+    async def __aenter__(self) -> _T:
+        return self._cm.__enter__()
+
+    async def __aexit__(
+        self,
+        exc_type: typing.Optional[typing.Type[BaseException]],
+        exc_value: typing.Optional[BaseException],
+        traceback: typing.Optional[types.TracebackType],
+    ) -> typing.Optional[bool]:
+        return self._cm.__exit__(exc_type, exc_value, traceback)
+
+
+
+
+# wrapper 공부하기
+def _wrap_gen_lifspan_context(
+    lifespan_context: typing.Collable[[typing.Any], typing.Generator]
+) -> typing.Collable[[typing.Any], typing.AsyncContextManager]:
+    """
+    함수를 래핑하고, 일반적인 제너레이터 컨텍스트 매니저를 비동기 컨텍스트 매니저로 변환하는 데 사용.
+    일반적인 동기 코드와 비동기 코드 간의 호환성을 유지하면서 컨텍스트 매니저를 적용하는 것이 목적이다.
+    
+    `lifespan_context`는 일반적인 제너레이터 컨텍스트 매니저를 반환하는 함수이다. 
+    이 함수를 비동기 컨텍스트 매니저로 변환하여 반환한다.
+
+    """
+
+    cmgr = contextlib.contextmanager(lifespan_context) # 제너레이터 컨텍스트 매니저를 생성한다.
+
+    @functools.wraps(cmgr) # 원래 함수를 래핑하는 데 사용된다. 원래 함수의 정보를 유지한다.
+    def wrapper(app: typing.Any) -> _AsyncLiftContextManager:
+        return _AsyncLiftContextManager(cmgr(app))
+    
+    return wrapper
