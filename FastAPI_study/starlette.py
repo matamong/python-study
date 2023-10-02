@@ -1,7 +1,9 @@
 import functools
 from tkinter import SE
+import trace
 import typing
 from urllib import response
+from xml.etree.ElementInclude import include
 from fastapi import HTTPException, WebSocket
 from fastapi.concurrency import run_in_threadpool
 
@@ -147,6 +149,7 @@ class BaseRoute:
 # 동적이란 말은 실행 중에 검사할 수 있다는 뜻이다.
 import inspect
 import contextlib
+import traceback
 
 from starlette.types import ASGIApp
 from starlette._utils import is_async_callable
@@ -533,7 +536,9 @@ class _AsyncLiftContextManager(typing.AsyncContextManager[_T]):
 ################################
 import warnings
 
+from starlette.responses import PlainTextResponse, RedirectResponse
 from starlette.types import Lifespan
+from starlette.datastructures import URL
 
 # wrapper 공부하기
 def _wrap_gen_lifspan_context(
@@ -597,8 +602,8 @@ class Router:
         self.routes = [] if routes is None else list(routes)
         self.redirect_slashes = redirect_slashes
         self.default = self.not_found if default is None else default
-        self.on_startup = [] if on_startup is None else list(on_startup)
-        self.on_shutdown = [] if on_shutdown is None else list(on_shutdown)
+        self.on_startup = [] if on_startup is None else list(on_startup)    # 시작 될 때 실행해야 할 작업들
+        self.on_shutdown = [] if on_shutdown is None else list(on_shutdown) # 종료될 때 실행해야 할 작업들
 
         if on_startup or on_shutdown:
             warnings.warn(
@@ -653,3 +658,131 @@ class Router:
             except NoMatchFound:
                 pass 
         raise NoMatchFound(__name, path_params) # 모든 route에서 일치하는 경로를 찾지 못한 경우, NoMatchFound 예외를 발생시킨다.
+    
+
+    async def startup(self) -> None:
+        """
+        `.on_startup` 이벤트 핸들러들을 구동한다. 비동기라면 비동기로, 동기라면 동기로.
+        """
+        for handler in self.on_startup:
+            if is_async_callable(handler):
+                await(handler)
+            else:
+                handler()
+    
+    async def lifespan(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """
+         ASGI lifespan message를 처리하여 애플리케이션의 시작과 종료 시점에 필요한 작업을 관리한다.
+        (ASGI lifespan message는 우리가 app의 startup과 shutdown 이벤트들을 관리할 수 있게해주는 메시지 프로콜임.)
+        """
+        started = False
+        app: typing.Any = scope.get("app")
+        await receive() # ASGI 메시지 수신
+        try:
+            async with self.lifespan_context(app) as maybe_state:
+                if maybe_state is not None:
+                    if "state" not in scope:
+                        raise RuntimeError(
+                            '서버는 lifespan scope에서 "state"를 지원하지 않습니다잉'
+                        )
+                    scope["state"].update(maybe_state)  # 애플리케이션의 상태 정보를 scope에 업데이트
+                await send({"type": "lifespan.startup.complete"})
+                started = True
+                await receive()
+        except BaseException:
+            exc_text = traceback.format_exc()
+            if started:
+                await send({"type": "lifespan.startup.failed", "message": exc_text})
+            else:
+                await send({"type": "lifespan.startup.failed", "message": exc_text})
+            raise
+        else:
+            await send({"type": "lifespan.shutdown.complete"})
+    
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """
+        Router 클래스의 메인 entry point.
+        """
+        assert scope["type"] in ("http", "websocket", "lifespan")
+
+        if "router" not in scope:
+            scope["router"] = self
+        
+        if scope["type"] == "lifespan":
+            await self.lifespan(scope, receive, send)
+            return
+        
+        partial = None
+
+        for route in self.routes:
+            # 받은 scope에서 route들이 매치되는지 찾고 있으면 넘겨준다
+            match, child_scope = route.mathces(scope)
+            if match == Match.FULL:
+                scope.update(child_scope)
+                await route.handle(scope, receive, send)
+                return
+            elif match == Match.PARTIAL and partial is None:
+                partial = route
+                partial_scope = child_scope
+
+        if partial is not None:
+            # partial 매치들을 다룬다. endpoint가 request를 처리할 수 있지만, 선호되는 option은 아닐 때 사용된다.
+            # 405 Method Not Allowed를 다룰 때 사용된다고한다.
+            scope.update(partial_scope)
+            await partial.handle(scope, receive, send)
+            return
+        
+        # 슬래시가 없는 경우에 슬래시가 있는 URL로 리디렉션
+        if scope["type"] == "http" and self.redirect_slashes and scope["path"] != "/":
+            redirect_scope = dict(scope)
+            if scope["path"].endswith("/"):
+                redirect_scope["path"] = scope["path"].rstrip("/")
+            else:
+                redirect_scope["path"] = scope["path"] + "/"
+        
+            for route in self.routes:
+                mathc, child_scope = route.matches(redirect_scope)
+                if match != Match.NONE:
+                    redirect_url = URL(scope=redirect_scope)
+                    response = RedirectResponse(url=str(redirect_url))
+                    await response(scope, receive, send)
+                    return
+        
+        await self.default(scope, receive, send)
+
+        def __eq__(self, other: typing.Any) -> bool:
+            return isinstance(other, Router) and self.routes == other.routes
+        
+        def mount(
+            self, path: str, app: ASGIApp, name: typing.Optional[str] = None
+        ) -> None: # pragma: no cover <-- 테스트에서 제외
+            """
+            """
+            route = Mount(path, app=app, name=name)
+            self.routes.append(route)
+
+        def host(
+            self, host: str, app: ASGIApp, name: typing.Optional[str] = None
+        ) -> None: ...
+
+        def add_route(
+            self, 
+            path: str,
+            endpoint:typing.Callable,
+            methods: typing.Optional[typing.List[str]] = None,
+            name: typing.Optional[str] = None,
+            include_in_schema: bool = True,
+        ) -> None: # pragma: noconver
+            route = Route(
+                path,
+                endpoint=endpoint,
+                methods=methods,
+                name=name,
+                include_in_schema=include_in_schema,
+            )
+            self.routes.appned(route)
+        
+        ...
+
+            
+            
