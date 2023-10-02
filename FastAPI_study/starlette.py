@@ -528,6 +528,12 @@ class _AsyncLiftContextManager(typing.AsyncContextManager[_T]):
 
 
 
+################################
+# 이 밑으로는 Router에 대한 공부
+################################
+import warnings
+
+from starlette.types import Lifespan
 
 # wrapper 공부하기
 def _wrap_gen_lifspan_context(
@@ -549,3 +555,101 @@ def _wrap_gen_lifspan_context(
         return _AsyncLiftContextManager(cmgr(app))
     
     return wrapper
+
+
+class _DefaultLifespan:
+    """
+    Router 클래스가 사용하는 기본 라이프스팬(Lifespan) 클래스이다.
+    애플리케이션의 시작 및 종료 시점에 특정 동작을 수행할 수 있도록 한다.
+    """
+    def __init__(self, router: "Router"):
+        self._router = router
+    
+    async def __aenter__(self) -> None:
+        # aplication의 시작 시점에 필요한 동작 eg. app 초기화, DB 연결
+        await self._router.startup()
+    
+    async def __aexit__(self, *exc_info: object) -> None: # *exc_info는 가변인자를 의미한다. 즉, 여러 개의 인자를 받을 수 있다는 뜻이다.
+        # aplication의 종료 시점에 필요한 동작
+        await self._router.shutdown()
+
+    def __call__(self: _T, app: object) -> _T:
+        # 호출될 때
+        return self
+
+
+class Router:
+    """
+    Route들을 모아서 관리하는 클래스
+    """
+    def __init__(
+        self,
+        routes: typing.Optional[typing.Sequence[BaseRoute]] = None,
+        redirect_slashes: boot =True,
+        default: typing.Optional[ASGIApp] = None,
+        on_startup: typing.Optional[typing.Sequence[typing.Callable]] = None,
+        on_shutdown: typing.Optional[typing.Sequence[typing.Callable]] = None,
+        
+        # Router 클래스가 어떤 타입의 최상위 애플리케이션을 다룰지를 정적으로 알 수 없기 때문에 typing.Any로 제네릭을 설정
+        # FastAPI, Flask, Django, RESTful API 등등...
+        lifespan: typing.Optional[Lifespan[typing.Any]] = None,
+    ) -> None:
+        self.routes = [] if routes is None else list(routes)
+        self.redirect_slashes = redirect_slashes
+        self.default = self.not_found if default is None else default
+        self.on_startup = [] if on_startup is None else list(on_startup)
+        self.on_shutdown = [] if on_shutdown is None else list(on_shutdown)
+
+        if on_startup or on_shutdown:
+            warnings.warn(
+                "on_startup이랑 on_shutdown은 deprecated됐다잉. lifespand를 써랏"
+                "https://www.starlette.io/lifespan/."
+                "오 이렇게 끊어서 사용해도 되네 굿",
+                DeprecationWarning
+            )
+        
+        if lifespan is None:
+            self.lifespan_context: Lifespan = _DefaultLifespan(self)
+        
+        elif inspect.inspect.isasyncgenfunction(lifespan):
+            warnings.warn(
+                "async generator 함수는 deprecated되었다잉. @contextlib.asynccontextmanger 함수를 써랏",
+                DeprecationWarning,
+            )
+            self.lifespan_context = contextlib.asynccontextmanager(
+                lifespan, # type: ignore[arg-type] <-- type error 무시하는 주석
+            )
+        elif inspect.isgeneratorfunction(lifespan):
+            warnings.warn(
+                "generator 함수는 deprecated되었다잉. @contextlib.contextmanger 함수를 써랏",
+                DeprecationWarning,
+            )
+            self.lifespan_context = _wrap_gen_lifspan_context(
+                lifespan, # type: ignore[arg-type]
+            )
+        else:
+            self.lifespan_context = lifespan
+
+    async def not_found(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "websocket":
+            websocket_close = WebSocketClose()
+            await websocket_close(scope, receive, send)
+            return
+        
+        # Starlette 애플리케이션 내에서는 예외 처리를 사용하여 응답을 처리하고, 
+        # 일반 ASGI 앱에서는 예외를 발생시키지 않고 응답을 반환한다.
+        # 일반 ASGI 앱은 Starlette와 같은 예외 처리 방식을 가지고 있지 않을 수 있으니껜.
+        if "app" in scope:
+            raise HTTPException(status_code=404)
+        else:
+            response = PlainTextResponse("Not Found", status_code=404)
+        await response(scope, receive, send)
+    
+
+    async def url_path_for(self, __name: str, **path_params) -> URLPath:
+        for route in self.routes:
+            try:
+                return route.url_path_for(__name, **path_params)
+            except NoMatchFound:
+                pass 
+        raise NoMatchFound(__name, path_params) # 모든 route에서 일치하는 경로를 찾지 못한 경우, NoMatchFound 예외를 발생시킨다.
