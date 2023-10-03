@@ -1,3 +1,15 @@
+"""
+Starlette의 routing에 대한 공부.
+https://www.starlette.io/routing/
+"""
+
+### 참고 모듈
+from starlette.endpoints import HTTPEndpoint
+from starlette.responses import PlainTextResponse
+###
+
+
+
 import functools
 from tkinter import SE
 import trace
@@ -270,10 +282,15 @@ def websocket_session(func: typing.Callable) -> ASGIApp:
 
 
 class Route(BaseRoute):
+    """
+    URL 경로와 뷰 함수(핸들러)를 연결하는 역할.
+    각 `Route`객체는 특정 URL 경로와 연결된 뷰 함수를 가지고 있다.
+    요청이 해당 경로로 들어오면 연결된 뷰 함수를 호출한다.
+    """
     def __init__(
         self,
         path: str,
-        endpoint: typing.Callable,
+        endpoint: typing.Callable, # 단일 request를 받고 response를 내보내는 동기나 비동기함수 HTTPEndpint. 혹은 ASGI interface를 구현한 클래스 (Starlette의 HTTPEndpoint같은거)
         *,
         methods: typing.Sequence[str] = None,
         name: typing.Optional[str] = None,
