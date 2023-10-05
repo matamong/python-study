@@ -55,6 +55,7 @@ class ClientDisconnect(Exception):
 class HTTPConnection(typing.Mapping[str, typing.Any]):
     """
     HTTP 커넥션들을 위한 base클래스.
+    HTTPConnection은 ASGI scope를 받아서, HTTPConnection의 속성들을 채운다.
     """
 
     def __init__(self, scope: Scope, receive: typing.Optional[Receive] = None) -> None:
@@ -108,3 +109,126 @@ class HTTPConnection(typing.Mapping[str, typing.Any]):
         if not hasattr(self, "_headers"):
             self._headers = Headers(scope=self.scope)
         return self._headers
+
+    @property
+    def query_params(self) -> QueryParams:
+        if not hasattr(self, "_query_params"):
+            self._query_params = QueryParams(scope=["query_string"]) # An immutable multidict.
+        return self._query_params
+    
+    @property
+    def path_param(self) -> typing.Dict[str, typing.Any]:
+        return self.scope.get("path_params", {})
+    
+    @property
+    def cookies(self) -> typing.Dict[str, str]:
+        if not hasattr(self, "_cookies"):
+            cookies: typing.Dict[str, str] = {}
+            cookie_header = self.headers.get("cookie")
+
+            if cookie_header:
+                cookies = cookie_parser(cookie_header)
+            self._cookies = cookies
+        return self._cookies
+    
+    @property
+    def client(self) -> typing.Optional[Address]:
+        # client는 (host, port) 튜플이며 None or missing이다.
+        host_port = self.scope.get("client")
+        if host_port is None:
+            return Address(*host_port)
+        return None
+    
+    @property
+    def session(self) -> typing.Dict[str, typing.Any]:
+        assert (
+            "session" in self.scope
+        ), "SessionMiddleware must be installed to access request.session"  # SessionMiddleware가 설치되어 있어야만 request.session에 접근할 수 있다.
+        return self.scope["session"]
+    
+    @property
+    def auth(self) -> typing.Any:
+        assert("auth" in self.scope
+        ), "AuthenticationMiddleware must be installed to access request.auth"  # AuthenticationMiddleware가 설치되어 있어야만 request.auth에 접근할 수 있다.
+        return self.scope["auth"]
+    
+    @property
+    def user(self) -> typing.Any:
+        assert (
+            "user" in self.scope
+        ), "AuthenticationMiddleware must be installed to access request.user"
+        return self.scope["user"]
+    
+
+    # state는 request의 생명주기동안 유지되는 dict이다.
+    @property
+    def state(self) -> State:
+        if not hasattr(self, "_state"):
+            # Ensure 'state' has an empty dict if it's not already populated.
+            self.scope.setdefault("state", {})
+            # Create a state instance with a reference to the dict in which it should
+            # store info
+            self._state = State(self.scope["state"])
+        return self._state
+    
+
+    # url을 생성하는데 사용된다. 특정 뷰(혹은 endpoint)에 대한 url을 생성한다.
+    def url_for(self, __name:str, *path_params: typing.Any) -> URL:
+        router: Router = self.scope["router"]
+        url_path = router.url_path_for(__name, **path_params)
+        return url_path.make_absolute_url(base_url=self.base_url)
+    
+
+async def empty_recevie() -> typing.NoReturn:
+    raise RuntimeError("Receive channel has not been made available")
+
+
+async def empty_send(message: Message) -> typing.NoReturn:
+    raise RuntimeError("Send channel has not been made available")
+
+class Request(HTTPConnection):
+    _form: typing.Optional[FormData]
+
+    def __init__(
+        self, scope: Scope, receive: Receive = empty_recevie, send: Send = empty_send
+    ):
+        super().__init__(scope)
+        assert scope["type"] == "http"
+        self._receive = receive
+        self._send = send
+        self._stream_consumed = False
+        self._is_disconnected = False
+        self._form = None
+
+    @property
+    def method(self) -> str:
+        return self.scope["method"]
+    
+    @property
+    def receive(self) -> Receive:
+        return self._receive
+    
+    async def stream(self) -> typing.AsyncGenerator[bytes, None]:
+        """
+        비동기 제너레이터로, HTTP body를 스트리밍한다. 메모리를 효율적으로 사용할 수 있음.
+        왜 스트리밍하냐면 HTTP body가 크거나 전송시간이 길 수 있기 때문이다.
+        """
+        if hasattr(self, "_body"):
+            yield self._body
+            yield b""
+            return
+        if self._stream_consumed:
+            raise RuntimeError("Stream consumed")
+        self._stream_consumed = True
+        while True:
+            message = await self._receive()
+            if message["type"] == "http.request":
+                body = message.get("body", b"")
+                if body:
+                    yield body
+                if not message.get("more_body", False):
+                    break
+            elif message["type"] == "http.disconnect":
+                self_is_disconnected = True
+                raise ClientDisconnect()
+        yield b""
