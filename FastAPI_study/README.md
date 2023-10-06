@@ -1,3 +1,13 @@
+# 목차
+
+- [패키지의 `__init__.py`에 모듈 모아놓는 이유](#--------init--py-------------)
+    + [모듈 엑세스가 편해진다](#------------)
+    + [가시성 향상](#------)
+- [왜 DB Dependency는 Gerator일까? (🚧 WIP)](#--db-dependency--gerator--------wip-)
+
+<br><br>
+
+
 # 패키지의 `__init__.py`에 모듈 모아놓는 이유
 ### 모듈 엑세스가 편해진다
 - 패키지만 불러와도 `__init__.py`에 있는 모듈들 불러올 수 있음
@@ -15,7 +25,7 @@ result = mypackage.mymodule.my_function()
 
 
 
-# Why generator for DB Dependency? (🚧 WIP)
+# 왜 DB Dependency는 Gerator일까? (🚧 WIP)
 
 DB 의존성 주입에서, 보통 DB session 연결과 닫을 때는 시작과 끝을 깔끔하게 처리해주는 `Context Manager`로 처리해야한다고 생각했는데, <br>`Generator`를 이용해서 그 처리를 해주더라. <br>
 바로 아래와 같이 말이다.
