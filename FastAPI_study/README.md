@@ -1,7 +1,7 @@
 # 목차
 
 - [패키지의 `__init__.py`에 모듈 모아놓는 이유](#패키지의-`__init__.py`에-모듈-모아놓는-이유)
-- [왜 DB Dependency는 Generator일까? (🚧 WIP)](#왜-DB-dependency는-generator일까?-(🚧-wip))
+- [왜 DB Dependency는 Generator일까? (🚧 WIP)](#왜-db-dependency는-generator일까?-(🚧-wip))
 
 <br><br>
 
