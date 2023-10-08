@@ -1,7 +1,22 @@
+"""
+Starlette의 routing에 대한 공부.
+https://www.starlette.io/routing/
+"""
+
+### 참고 모듈
+from starlette.endpoints import HTTPEndpoint
+from starlette.responses import PlainTextResponse
+###
+
+
+
 import functools
 from tkinter import SE
+import trace
 import typing
-from fastapi import WebSocket
+from urllib import response
+from xml.etree.ElementInclude import include
+from fastapi import HTTPException, WebSocket
 from fastapi.concurrency import run_in_threadpool
 
 from fastapi.responses import PlainTextResponse 
@@ -58,6 +73,8 @@ class BaseRoute:
 
     def matches(self, scope: Scope) -> typing.Tuple[Match, Scope]:
         """
+        요약: ASGI 요청과 현재 Route의 경로를 일치시키고, 일치한 경우에 대한 정보를 반환
+        
         라우트가 scope와 일치하는지 확인한다.
         Scope는 웹 프레임워크에서 사용되는 용어로,
         request, response과 관련된 정보를 포함하는 dicrioanry이다.
@@ -145,10 +162,27 @@ class BaseRoute:
 import inspect
 import re
 
+import contextlib
+import traceback
+
 from starlette.types import ASGIApp
 from starlette._utils import is_async_callable
 from starlette.requests import Request
 from starlette.convertors import Convertor, CONVERTOR_TYPES # URL 경로 변환기
+
+
+def NoMatchFound(Exception):
+    """
+    `.url_for(name, **path_params)`, `url_path_for(name, **path_params)`에 의해서 일어나며,
+    맞는 route가 없을 때 발생한다.
+
+    대체로 Exception의 경우 모듈 맨 위에 있어야하는거 잊지말기ㅣㅣ 여기선 공부용이니껜 여기 둠!
+    """
+
+    def __init__(self, name: str, path_params: typing.Dict[str, typing.Any]) -> None:
+        params = ",".join(list(path_params.keys()))
+        super().__init__(f'No route exists for name "{name}" and params "{params}".')
+
 
 def get_name(endpoint: typing.Callable) -> str:
     """
@@ -163,6 +197,31 @@ def get_name(endpoint: typing.Callable) -> str:
     if inspect.isfunction(endpoint) or inspect.isclass(endpoint):
         return endpoint.__name__
     return endpoint.__class__.__name__
+
+
+def replace_params(
+        path: str,
+        param_convertors: typing.Dict[str, Convertor],
+        path_params: typing.Dict[str, str],
+) -> typing.Tuple[str, dict]:
+    """
+    경로에 있는 파라미터 플레이스홀더를 실제 값으로 대체하고 대체된 경로와 업데이트된 파라미터 딕셔너리를 반환.
+
+    params:
+        path: 경로 문자열
+        param_convertors: 파라미터의 이름과 파라미터 변환기를 매핑한 딕셔너리
+        path_params: 경로 파라미터를 담고 있는 딕셔너리
+    
+    return:
+        Tuple[str, dict]: 대체된 경로와 업데이트된 파라미터 딕셔너리
+    """
+    for key, value in list(path.parmas.items()):
+        if "{" + key + "}" in path:
+            convertor = param_convertors[key]
+            value = convertor.to_string(value)
+            path = path.replace("{" + key + "}", value)
+            path_params.pop(key)
+    return path, path_params
 
 
 def request_response(func: typing.Callable) -> ASGIApp:
@@ -277,12 +336,34 @@ def compile_path(
         return re.compile(path_regex), path_format, param_convertors
 
 
+def websocket_session(func: typing.Callable) -> ASGIApp:
+    """
+    `func(session)` 코루틴을 받아서 ASGI 애플리케이션을 반환한다.
+    """
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        """
+        ASGI 애플리케이션 함수.
+        
+        Args:
+            scope (Scope): ASGI 요청 스코프.
+            receive (Receive): 메시지 수신을 위한 함수.
+            send (Send): 메시지 전송을 위한 함수.
+        """
+        session = WebSocket(scope, receive=receive, send=send)
+        await func(session)
+    return app
+
 
 class Route(BaseRoute):
+    """
+    URL 경로와 뷰 함수(핸들러)를 연결하는 역할.
+    각 `Route`객체는 특정 URL 경로와 연결된 뷰 함수를 가지고 있다.
+    요청이 해당 경로로 들어오면 연결된 뷰 함수를 호출한다.
+    """
     def __init__(
         self,
         path: str,
-        endpoint: typing.Callable,
+        endpoint: typing.Callable, # 단일 request를 받고 response를 내보내는 동기나 비동기함수 HTTPEndpint. 혹은 ASGI interface를 구현한 클래스 (Starlette의 HTTPEndpoint같은거)
         *,
         methods: typing.Sequence[str] = None,
         name: typing.Optional[str] = None,
@@ -331,6 +412,296 @@ class Route(BaseRoute):
         else:
             # Endpoint가 클래스일 때. ASGI로 다룬다.
             self.app = endpoint
+
+        if methods is None:
+            self.methods = None
+        else:
+            self.methods = {method.upper() for method in methods}
+            if "GET" in self.methods:
+                self.methods.add("HEAD")
+
+        self.path_regex, self.path_format, self.param_convertors = compile_path(path)
+    
+
+    def matches(self, scope: Scope) -> typing.Tuple[Match, Scope]:
+        if scope["type"] == "http":
+            match = self.path_regex.match(scope["path"])
+            if match:
+                matched_params = match.groupdict()
+                for key, value in matched_params.items():
+                    matched_params[key] = self.param_convertors[key].convertor(value) 
+                path_params = dict(scope.get("path_params", {})) # dictionary의 원하는 데이터를 안전하게 불러올 수 있음 오 굿굿
+                path_params.update(matched_params)
+                child_scope = {"endpoint": self.endpoint, "path_params": path_params}
+                if self.methods and scope["method"] not in self.methods:
+                    return Match.PARTIAL, child_scope
+                else:
+                    return Match.FULL, child_scope
+        return Match.NONE, {}
+
+
+    def url_path_for(self, __name: str, **path_params: typing.Any) -> URLPath:
+        """
+        라우트의 URL 경로를 생성한다.
+        """
+        seen_params = set(path_params.keys())
+        expected_params = set(self.param_convertors.keys())
+
+        if __name != self.name or seen_params != expected_params:
+            raise NoMatchFound(__name, path_params)
+
+        path, remaining_params = replace_params(
+            self.path_format, self.param_convertors, path_params
+        )
+        assert not remaining_params
+        return URLPath(path=path, protocol="http")
+    
+
+    async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """
+        ASGI 요청을 처리한다. 그래서 코루틴이다.
+        """
+        if self.methods and scope["method"] not in self.methods:
+            headers = {"Allow": ", ".join(self.methods)}
+            if "app" in scope:
+                raise HTTPException(status_code=405, headers=headers)
+            else:
+                response = PlainTextResponse(
+                    "Method Not Allowed", status_code=405, headers=headers
+                )
+            await response(scope, receive, send)
+        else:
+            await self.app(scope, receive, send)
+    
+
+    def __eq__(self, other: typing.Any) -> bool:
+        return(
+            isinstance(other, Route)
+            and self.path == other.path
+            and self.endpoint == other.endpoint
+            and self.methods == other.methods
+        )
+
+
+    def __repr__(self) -> str:
+        class_name = self.__class__.__name__
+        methods = sorted(self.methods or [])
+        path, name = self.path, self.name
+        return f"{class_name}(path={path!r}, name={name!r}, methods={methods!r})" 
+    
+
+
+class WebSocketRoute(BaseRoute):
+    """
+    비슷해서 패스
+    """
+    pass
+
+
+class Mount(BaseRoute):
+    """
+    path와 해당 경로에 연결된 app 또는 route 설정,
+    middleware 적용
+    """
+
+    def __init__(
+        self,
+        path: str,
+        app: typing.Optional[ASGIApp] = None,
+        routes: typing.Optional[typing.Sequence[BaseRoute]] = None,
+        name: typing.Optional[str] = None,
+        *,
+        middleware: typing.Optional[typing.Sequence[Middleware]] = None,
+    ) -> None:
+        assert path == "" or path.startswith("/"), "Routed paths must always start with '/'"
+        assert(
+            app is not None or routes is not None
+        ), "Either an 'app' or 'routes' must be provided."
+        self.path = path.rstrip("/")
+        if app is not None:
+            self._base_app: ASGIApp = app
+        else:
+            self._base_app = Router(routes=routes)
+        self.app = self._base_app
+        if middleware is not None:
+            for cls, options in reversed(middleware):
+                """
+                미들웨어는 순서가 중요하다.
+                그러므로 여기서 미들웨어를 역순으로 stack에 쌓는다.
+                그래서 맨 마지막에 쌓인 미들웨어가 가장 먼저 실행된다.
+                """
+                self.app = cls(self.app, **options)
+        self.name = name
+        self.path_regex, self.path_format, self.param_convertors = compile_path(
+            self.path + "/{path:path}"
+        )
+
+    
+    @property # 읽기 전용 속성을 만들 때 사용한다. 함수를 속성처럼 사용할 수 있다. 이 말인 즉슨, 함수를 호출할 때 ()를 붙이지 않아도 된다는 뜻이다.
+    def routes(self) -> typing.List[BaseRoute]:
+        return getattr(self._base_app, "routes", [])
+    
+
+    def matches(self, scope: Scope) -> typing.Tuple[Match, Scope]:
+        if scope["type"] in ("http", "websocket"):
+            path = scope["path"]
+            match = self.path_regex.match(path)
+            if match:
+                
+                """
+                path를 정규식과 비교하여 일치하는 경우,
+                정규식 패턴에 의해 일치된 그룹들을 딕셔너리로 가져오는 부분
+                self.path_regex 패턴에 정의된 경로에 다음과 같은 그룹들이 있다고 가정하자.
+                    {user:str}
+                    {post_id:int}
+                    {category:str}
+                
+                주어진 path 문자열이 '/matamong/123/backend' 라면, matched_params는 다음과 같다.
+                    "user": "john" (str 그룹)
+                    "post_id": "123" (int 그룹)
+                    "category": "tech" (str 그룹)
+                
+                """
+                matched_params = match.groupdict()
+
+
+                for key, value in matched_params.items():
+                    matched_params[key] = self.param_convertors[key].converter(value)  # 경로의 각 매개변수를 해당하는 변환기를 사용하여 변환
+                remaining_path = "/" + matched_params.pop("path") # 남은 경로를 가져오고, "path" 매개변수는 따로 처리 eg. /api/users/{path:path}
+                matched_path = path[: -len(remaining_path)] # 일치하는 경로를 추출
+                path_parmas = dict(scope.get("path_parmas", {}))
+                path_parmas.update(matched_params) # 경로 매개변수를 업데이트
+                root_path = scope.get("root_path", "")
+
+                # 새로운 스코프를 생성하여 경로 매개변수 및 경로 정보를 전달
+                child_scope = {
+                    "path_params": path_parmas,
+                    "app_root_path": scope.get("app_root_path", root_path),
+                    "root_path": root_path + matched_path,
+                    "path": remaining_path,
+                    "endpoint": self.app,
+                }
+                return Match.FULL, child_scope
+            return Match.NONE, {}
+ 
+ # 이하 다 비슷해서 생략
+
+
+"""
+PEP에서는 TypeVar를 사용할 때 _T, _U, _V 등의 이름을 사용하라고 권장한다.
+만약 인자가 있는 경우에는 그냥 사용해도 된다.
+
+eg.
+  _T = TypeVar("_T")
+  _P = ParamSpec("_P")
+  AddableType = TypeVar("AddableType", int, float, str)
+  AnyFunction = TypeVar("AnyFunction", bound=Callable)
+"""
+_T = typing.TypeVar("_T")
+
+
+class _AsyncLiftContextManager(typing.AsyncContextManager[_T]):
+    """
+    비동기 컨텍스트 매니저를 동기 컨텍스트 매니저로 변환하는 wrapper 클래스
+    동기와 비동기 컨텍스트 매니저의 호환성을 위해서 사용.
+    """
+    def __init__(self, cm: typing.ContextManager[_T]):
+        self._cm = cm
+    
+    async def __aenter__(self) -> _T:
+        return self._cm.__enter__()
+
+    async def __aexit__(
+        self,
+        exc_type: typing.Optional[typing.Type[BaseException]],
+        exc_value: typing.Optional[BaseException],
+        traceback: typing.Optional[types.TracebackType],
+    ) -> typing.Optional[bool]:
+        return self._cm.__exit__(exc_type, exc_value, traceback)
+
+
+
+################################
+# 이 밑으로는 Router에 대한 공부
+################################
+import warnings
+
+from starlette.responses import PlainTextResponse, RedirectResponse
+from starlette.types import Lifespan
+from starlette.datastructures import URL
+
+# wrapper 공부하기
+def _wrap_gen_lifspan_context(
+    lifespan_context: typing.Collable[[typing.Any], typing.Generator]
+) -> typing.Collable[[typing.Any], typing.AsyncContextManager]:
+    """
+    함수를 래핑하고, 일반적인 제너레이터 컨텍스트 매니저를 비동기 컨텍스트 매니저로 변환하는 데 사용.
+    일반적인 동기 코드와 비동기 코드 간의 호환성을 유지하면서 컨텍스트 매니저를 적용하는 것이 목적이다.
+    
+    `lifespan_context`는 일반적인 제너레이터 컨텍스트 매니저를 반환하는 함수이다. 
+    이 함수를 비동기 컨텍스트 매니저로 변환하여 반환한다.
+
+    """
+
+    cmgr = contextlib.contextmanager(lifespan_context) # 제너레이터 컨텍스트 매니저를 생성한다.
+
+    @functools.wraps(cmgr) # 원래 함수를 래핑하는 데 사용된다. 원래 함수의 정보를 유지한다.
+    def wrapper(app: typing.Any) -> _AsyncLiftContextManager:
+        return _AsyncLiftContextManager(cmgr(app))
+    
+    return wrapper
+
+
+class _DefaultLifespan:
+    """
+    Router 클래스가 사용하는 기본 라이프스팬(Lifespan) 클래스이다.
+    애플리케이션의 시작 및 종료 시점에 특정 동작을 수행할 수 있도록 한다.
+    """
+    def __init__(self, router: "Router"):
+        self._router = router
+    
+    async def __aenter__(self) -> None:
+        # aplication의 시작 시점에 필요한 동작 eg. app 초기화, DB 연결
+        await self._router.startup()
+    
+    async def __aexit__(self, *exc_info: object) -> None: # *exc_info는 가변인자를 의미한다. 즉, 여러 개의 인자를 받을 수 있다는 뜻이다.
+        # aplication의 종료 시점에 필요한 동작
+        await self._router.shutdown()
+
+    def __call__(self: _T, app: object) -> _T:
+        # 호출될 때
+        return self
+
+
+class Router:
+    """
+    Route들을 모아서 관리하는 클래스
+    """
+    def __init__(
+        self,
+        routes: typing.Optional[typing.Sequence[BaseRoute]] = None,
+        redirect_slashes: boot =True,
+        default: typing.Optional[ASGIApp] = None,
+        on_startup: typing.Optional[typing.Sequence[typing.Callable]] = None,
+        on_shutdown: typing.Optional[typing.Sequence[typing.Callable]] = None,
+        
+        # Router 클래스가 어떤 타입의 최상위 애플리케이션을 다룰지를 정적으로 알 수 없기 때문에 typing.Any로 제네릭을 설정
+        # FastAPI, Flask, Django, RESTful API 등등...
+        lifespan: typing.Optional[Lifespan[typing.Any]] = None,
+    ) -> None:
+        self.routes = [] if routes is None else list(routes)
+        self.redirect_slashes = redirect_slashes
+        self.default = self.not_found if default is None else default
+        self.on_startup = [] if on_startup is None else list(on_startup)    # 시작 될 때 실행해야 할 작업들
+        self.on_shutdown = [] if on_shutdown is None else list(on_shutdown) # 종료될 때 실행해야 할 작업들
+
+        if on_startup or on_shutdown:
+            warnings.warn(
+                "on_startup이랑 on_shutdown은 deprecated됐다잉. lifespand를 써랏"
+                "https://www.starlette.io/lifespan/."
+                "오 이렇게 끊어서 사용해도 되네 굿",
+                DeprecationWarning
+            )
         
         if methods is None:
             self.mothods = None
@@ -350,10 +721,186 @@ class Route(BaseRoute):
         self.path_regex, self.path_format, self.param_convertors = compile_path(path) # 컴파일된 경로 정규식, 포맷, 파라미터 변환기를 할당한다.
 
 
-        def matches(self, scope: Scope) -> typing.Tuple[Match, Scope]:
-            if scope["type"] == "http":
-                match = self.path_regex.match(scope["path"]) # path_regex와 path가 일치하는지 확인한다.
-            if match:
-                matched_params = match.groupdict()
-                for key, value in matched_params.items():
-                    matched_params[key] = self.param_convertors[key].convert(value)
+        if lifespan is None:
+            self.lifespan_context: Lifespan = _DefaultLifespan(self)
+        
+        elif inspect.inspect.isasyncgenfunction(lifespan):
+            warnings.warn(
+                "async generator 함수는 deprecated되었다잉. @contextlib.asynccontextmanger 함수를 써랏",
+                DeprecationWarning,
+            )
+            self.lifespan_context = contextlib.asynccontextmanager(
+                lifespan, # type: ignore[arg-type] <-- type error 무시하는 주석
+            )
+        elif inspect.isgeneratorfunction(lifespan):
+            warnings.warn(
+                "generator 함수는 deprecated되었다잉. @contextlib.contextmanger 함수를 써랏",
+                DeprecationWarning,
+            )
+            self.lifespan_context = _wrap_gen_lifspan_context(
+                lifespan, # type: ignore[arg-type]
+            )
+        else:
+            self.lifespan_context = lifespan
+
+
+    def matches(self, scope: Scope) -> typing.Tuple[Match, Scope]:
+        if scope["type"] == "http":
+            match = self.path_regex.match(scope["path"]) # path_regex와 path가 일치하는지 확인한다.
+        if match:
+            matched_params = match.groupdict()
+            for key, value in matched_params.items():
+                matched_params[key] = self.param_convertors[key].convert(value)
+
+
+    async def not_found(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "websocket":
+            websocket_close = WebSocketClose()
+            await websocket_close(scope, receive, send)
+            return
+        
+        # Starlette 애플리케이션 내에서는 예외 처리를 사용하여 응답을 처리하고, 
+        # 일반 ASGI 앱에서는 예외를 발생시키지 않고 응답을 반환한다.
+        # 일반 ASGI 앱은 Starlette와 같은 예외 처리 방식을 가지고 있지 않을 수 있으니껜.
+        if "app" in scope:
+            raise HTTPException(status_code=404)
+        else:
+            response = PlainTextResponse("Not Found", status_code=404)
+        await response(scope, receive, send)
+    
+
+    async def url_path_for(self, __name: str, **path_params) -> URLPath:
+        for route in self.routes:
+            try:
+                return route.url_path_for(__name, **path_params)
+            except NoMatchFound:
+                pass 
+        raise NoMatchFound(__name, path_params) # 모든 route에서 일치하는 경로를 찾지 못한 경우, NoMatchFound 예외를 발생시킨다.
+    
+
+    async def startup(self) -> None:
+        """
+        `.on_startup` 이벤트 핸들러들을 구동한다. 비동기라면 비동기로, 동기라면 동기로.
+        """
+        for handler in self.on_startup:
+            if is_async_callable(handler):
+                await(handler)
+            else:
+                handler()
+    
+    async def lifespan(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """
+         ASGI lifespan message를 처리하여 애플리케이션의 시작과 종료 시점에 필요한 작업을 관리한다.
+        (ASGI lifespan message는 우리가 app의 startup과 shutdown 이벤트들을 관리할 수 있게해주는 메시지 프로콜임.)
+        """
+        started = False
+        app: typing.Any = scope.get("app")
+        await receive() # ASGI 메시지 수신
+        try:
+            async with self.lifespan_context(app) as maybe_state:
+                if maybe_state is not None:
+                    if "state" not in scope:
+                        raise RuntimeError(
+                            '서버는 lifespan scope에서 "state"를 지원하지 않습니다잉'
+                        )
+                    scope["state"].update(maybe_state)  # 애플리케이션의 상태 정보를 scope에 업데이트
+                await send({"type": "lifespan.startup.complete"})
+                started = True
+                await receive()
+        except BaseException:
+            exc_text = traceback.format_exc()
+            if started:
+                await send({"type": "lifespan.startup.failed", "message": exc_text})
+            else:
+                await send({"type": "lifespan.startup.failed", "message": exc_text})
+            raise
+        else:
+            await send({"type": "lifespan.shutdown.complete"})
+    
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """
+        Router 클래스의 메인 entry point.
+        """
+        assert scope["type"] in ("http", "websocket", "lifespan")
+
+        if "router" not in scope:
+            scope["router"] = self
+        
+        if scope["type"] == "lifespan":
+            await self.lifespan(scope, receive, send)
+            return
+        
+        partial = None
+
+        for route in self.routes:
+            # 받은 scope에서 route들이 매치되는지 찾고 있으면 넘겨준다
+            match, child_scope = route.mathces(scope)
+            if match == Match.FULL:
+                scope.update(child_scope)
+                await route.handle(scope, receive, send)
+                return
+            elif match == Match.PARTIAL and partial is None:
+                partial = route
+                partial_scope = child_scope
+
+        if partial is not None:
+            # partial 매치들을 다룬다. endpoint가 request를 처리할 수 있지만, 선호되는 option은 아닐 때 사용된다.
+            # 405 Method Not Allowed를 다룰 때 사용된다고한다.
+            scope.update(partial_scope)
+            await partial.handle(scope, receive, send)
+            return
+        
+        # 슬래시가 없는 경우에 슬래시가 있는 URL로 리디렉션
+        if scope["type"] == "http" and self.redirect_slashes and scope["path"] != "/":
+            redirect_scope = dict(scope)
+            if scope["path"].endswith("/"):
+                redirect_scope["path"] = scope["path"].rstrip("/")
+            else:
+                redirect_scope["path"] = scope["path"] + "/"
+        
+            for route in self.routes:
+                mathc, child_scope = route.matches(redirect_scope)
+                if match != Match.NONE:
+                    redirect_url = URL(scope=redirect_scope)
+                    response = RedirectResponse(url=str(redirect_url))
+                    await response(scope, receive, send)
+                    return
+        
+        await self.default(scope, receive, send)
+
+        def __eq__(self, other: typing.Any) -> bool:
+            return isinstance(other, Router) and self.routes == other.routes
+        
+        def mount(
+            self, path: str, app: ASGIApp, name: typing.Optional[str] = None
+        ) -> None: # pragma: no cover <-- 테스트에서 제외
+            """
+            """
+            route = Mount(path, app=app, name=name)
+            self.routes.append(route)
+
+        def host(
+            self, host: str, app: ASGIApp, name: typing.Optional[str] = None
+        ) -> None: ...
+
+        def add_route(
+            self, 
+            path: str,
+            endpoint:typing.Callable,
+            methods: typing.Optional[typing.List[str]] = None,
+            name: typing.Optional[str] = None,
+            include_in_schema: bool = True,
+        ) -> None: # pragma: noconver
+            route = Route(
+                path,
+                endpoint=endpoint,
+                methods=methods,
+                name=name,
+                include_in_schema=include_in_schema,
+            )
+            self.routes.appned(route)
+        
+        ...
+
+            
+            
