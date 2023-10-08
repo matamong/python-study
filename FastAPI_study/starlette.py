@@ -143,10 +143,12 @@ class BaseRoute:
 # inspect module은 함수, 클래스, 메서드 등의 속성 및 구조를 동적으로 검사하고 분석한다.
 # 동적이란 말은 실행 중에 검사할 수 있다는 뜻이다.
 import inspect
+import re
 
 from starlette.types import ASGIApp
 from starlette._utils import is_async_callable
 from starlette.requests import Request
+from starlette.convertors import Convertor, CONVERTOR_TYPES # URL 경로 변환기
 
 def get_name(endpoint: typing.Callable) -> str:
     """
@@ -205,6 +207,77 @@ def request_response(func: typing.Callable) -> ASGIApp:
     
     return app
 
+
+# `{}`로 둘러쌓인 문자열을 찾음 `:`로 옵션도 찾음 eg. '{param}', '{parmam:int}'
+PARAM_REGEX = re.compile("{([a-zA-Z_][a-zA-Z0-9_]*)(:[a-zA-Z_][a-zA-Z0-9_]*)?}")
+
+
+def compile_path(
+        path: str,
+) -> typing.Tuple[typing.Pattern, str, typing.Dict[str, Convertor]]:
+    """
+    주어진 경로 str에서 변수와 그에 대한 정보를 추출하고, 정규식 패턴과 함께 반환한다.
+    "/{username:str}" "{subdomain}.mydomain.org" 같은 str을 받아서
+    (regex, format, {param_name:convertor}) 의 Tuple로 반환한다.
+    
+    **regex부분이라 심오하게 공부하진 않았고 Convertor를 어떻게 사용했는지만 참고**
+
+    params:
+        path: 경로 str
+    return:
+        Tuple[typing.Pattern, str, typing.Dict[str, Convertor]]
+            typing.Pattern: 경로에 대한 정규식 패턴 (ex: "/(?P<username>[^/]+)")
+            str: 경로에 대한 포맷 문자열 (ex: "/{username}")
+            typing.Dict[str, Convertor]: 경로에 대한 파라미터 변환기 ({"username": StringConvertor()})
+
+            Convertor 공부는 커밋 ee37dc 참고
+    """
+    is_host = not path.startswith("/")
+
+    path_regex = "^"
+    path_format = ""
+    duplicated_params = set()
+
+    idx = 0
+    param_convertors = {}
+    for match in PARAM_REGEX.finditer(path):
+        param_name, convertor_type = match.groups("str") # 
+        convertor_type = convertor_type.lstrip(":") # convertor_type의 맨 앞에 있는 ':'를 제거한다. (ex: ":str" -> "str")
+        assert(
+            convertor_type in CONVERTOR_TYPES
+        ), f"Unknown path converter '{convertor_type}'"
+        convertor = CONVERTOR_TYPES[convertor_type]
+
+        path_regex += re.escape(path[idx:match.start()])
+        path_regex += f"(?P<{param_name}>{convertor.regex})"
+
+        path_format += path[idx:match.start()]
+        path_format +=  "{%s}" % param_name
+
+        if param_name in param_convertors:
+            duplicated_params.add(param_name)
+        
+        param_convertors[param_name] = convertor
+
+        idx = match.end()
+
+        if duplicated_params:
+            names = ", ".join(sorted(duplicated_params))
+            ending = "s" if len(duplicated_params) > 1 else ""
+            raise ValueError(f"Duplicate parameter name{s}: {names}")
+        
+        if is_host:
+            path_regex += re.escape(path[idx:])
+            path_format += path[idx:]
+        else:
+            path_regex += re.escape(path[idx:]) + "$"
+        
+        path_format += path[idx:]
+
+        return re.compile(path_regex), path_format, param_convertors
+
+
+
 class Route(BaseRoute):
     def __init__(
         self,
@@ -259,4 +332,28 @@ class Route(BaseRoute):
             # Endpoint가 클래스일 때. ASGI로 다룬다.
             self.app = endpoint
         
+        if methods is None:
+            self.mothods = None
+        else:
+            self.methods = {method.upper() for method in methods}
+            if "GET" in self.methods:
+                # GET 메서드가 있으면 HEAD 메서드도 추가한다. 
+                # 왜냐하면, GET을 사용할 때 HEAD도 같이 사용을 하기로 약속되어 있기 때문이다.
+                # 왜 약속을 했냐면, GET과 HEAD를 동시에 써야 효율성, 네트워크 이득, 캐싱등에 좋기 때문이다.
+                # 예를 들면, 웹 브라우저가 각 이미지를 표시하기 전에 이미지해상도, 크기등을 알아야하는데
+                # HEAD 메서드를 사용하지 않으면 GET으로 다운로드를 받은 다음에야 정보를 알아낼 수 있기 때문에
+                # 효율적이지않다. GET으로 다운로드를 하기 전에 HEAD로 각 이미지의 메타데이터를 먼저 요청하면
+                # 필요한 이미지만 다운로드하므로 로딩 시간이 단축된다.
+                # 또는 HEAD로 브라우저, 서버의 캐싱된 웹 리소스가 최신인지 확인할 수 있기 때문에 효율적인 캐싱이 가능하다.
+                self.methods.add("HEAD")
         
+        self.path_regex, self.path_format, self.param_convertors = compile_path(path) # 컴파일된 경로 정규식, 포맷, 파라미터 변환기를 할당한다.
+
+
+        def matches(self, scope: Scope) -> typing.Tuple[Match, Scope]:
+            if scope["type"] == "http":
+                match = self.path_regex.match(scope["path"]) # path_regex와 path가 일치하는지 확인한다.
+            if match:
+                matched_params = match.groupdict()
+                for key, value in matched_params.items():
+                    matched_params[key] = self.param_convertors[key].convert(value)
