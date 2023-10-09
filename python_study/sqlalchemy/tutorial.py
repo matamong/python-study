@@ -172,6 +172,16 @@ for dict_row in result.mappings():
 https://docs.sqlalchemy.org/en/20/tutorial/dbapi_transactions.html#sending-parameters
 
 다음처럼 bounding형식으로 파라미터를 전달할 수 있다.
+Connection.execute() method는 파라미터들을 받는다.(bound paramter)
+bound parameter 방식으로 사용해야 드라이버가 파라미터를 적절하게 sanitize하여 처리할 수 있다.
+
+SQLInjection을 방지하기 위해 bound parameter를 사용해야한다.
+
+아래 예제의 동작은 각 parameter set당 하나의 INSERT문을 실행한다.(최적화는 되어있긴 함)
+executemany스타일로 여러개의 파라미터를 전달했고 commit as you go스타일로 커밋했다.
+
+execute와 executemany의 차이
+    - executemany는 result를 반환하지 않는다.
 """
 with engine.connect() as conn:
     conn.execute(
@@ -179,6 +189,45 @@ with engine.connect() as conn:
          [{"x": 11, "y": 12}, {"x": 13, "y": 14}],
         )
     conn.commit()
+
+
+
+# Executing with an ORM Session
+"""
+transactional / database 상호작용을 위해 SQLAlchemy는 Session이라는 객체를 제공한다.
+위에서 본 Connection과 매우 비슷하고, 실제로 Session이 사용되면 내부적으로 SQL을 날리는데 사용되는 Connection을 참조한다.
+
+아래의 예시는 위에서 본 connect를 사용하는 방식과 비슷하다.
+"""
+from sqlalchemy.orm import Session
+
+stmt = text("SELECT x, y FROM some_table WHERE y > :y ORDER BY x, y")
+with Session(engine) as session:
+    result = session.execute(stmt, {"x": 5})
+    for row in result:
+        print(f"x: {row.x}  y: {row.y}")
+
+
+
+"""
+아래는 bound parameter를 사용해서 UPDATE statement를 실행하는 예제이다. connect에서 본 것과 똑같다.
+executemany 스타일로 여러개의 파라미터를 전달했고 commit as you go스타일로 커밋.
+
+Tip:
+    Session은 트랜잭션이 종료된 후에 Connection을 유지하지 않는다.
+    다음 DB에 대해서 SQL을 실행해야 할 때 engine에서 새로운 Connection을 가져온다.
+    이렇게 트랜잭션을 관리함.
+
+여기서 session_basic.py의 Basic of Using a Session을 참고하자.
+"""
+with Session(engine) as session:
+    result = session.execute(
+        text("UPDATE some_table SET y=:y WHERE x=:x"),
+        [{"x": 9, "y": 11}, {"x": 13, "y": 15}],
+    )
+    session.commit()
+
+
 
 
 
