@@ -39,6 +39,7 @@ Session.commit()을 호출할지는 선택이며
 session으로 수행한 작업에 DB에 유지될 새 데이터가 포함된 경우에만 필요하다.
 SELECT만 호출하고 변경 사항을 쓸 필요가 없다면 commit()을 호출할 필요가 없다.
 """
+from random import seed
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -127,5 +128,127 @@ with Session.begin() as session:
 
 # Querying
 """
+select() 구문을 사용해서 Select object를 생성한 다음,
+Session.execute() 및 Session.scalars()같은 메서드를 사용해서 Result를 반환하기 위해 쿼링을 한다.
+ScalarResult와 같은 Result객체로 반환된다.
+
+쿼링 가이드느 여기로 -> https://docs.sqlalchemy.org/en/20/orm/queryguide/index.html
+SQLAlchemy가 2.X로 업데이트되면서, Query API는 더 이상 사용되지 않는다. (레거시 플젝을 위해 지원은 한다.)
+SQLAlchemy Core가 select()하기 위해 사용하는 Session.execute()방법을 사용한다.
+이 방법은 Query처럼 한 번에 모든 것을 실행하지않고 단계를 거친다.
+"""
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+with Session(engine) as session:
+    # 'User' object들을 위한 쿼리
+    stmt = select(User).filter_by(name="ed") 
+    
+    # User object들의 list
+    user_obj = session.scalars(stmt).all() 
+
+    # 각각의 column들을 위한 쿼리
+    stmt = select(User.name, User.fullname)
+
+    # Row object들의 list
+    rows = session.execute(stmt).all()
+
+
+## SELECT를 써보자
+"""
+select() 함수를 사용해야 SELECT 구문이 생성되고 Select object를 반환한다.
+리턴할 entity나 SQL 표현식(eg. column)은 위치에 따라 함수에 전달된다.
+Select.Where()메서드같은 추가적인 메서드를 사용하면 완전한 문장을 만들 수 있다.
+"""
+stmt = select(User).where(User.name == "spongebob")
+
+result = session.execute(stmt)
+
+for user_obj in result.scalars():
+    print(f"{user_obj.name} {user_obj.fullname}")
+"""
+이렇게 완성된 Select Object(stmt)가 주어지면,
+ORM 내에서 결과 행을 얻기 위해 객체는 Session.execute()에 전달되며, 그런 다음 Result 객체가 반환된다.
+SQL은 다음과 같다.
+
+SELECT user_account.id, user_account.name, user_account.fullname
+FROM user_account
+WHERE user_account.name = ?
+[...] ('spongebob',)
+"""
+
+
+
+## Selecting ORM Entities and Attributes
+"""
+! 잠깐 !
+ORM에서 ENTITY(엔티티)는 테이블의 데이터. 엔티티 클래스는 테이블과 일대일로 매핑되는 클래스인 것을 알고 가자.
+"""
 
 """
+select() 함수는 ORM과 관련된 객체들을 다루는데 사용되며, 
+ORM-주석이 달린 엔터티를 포함하는 경우 Session 객체를 통해 실행하는 것이 일반적이다. (ORM-Mapping된 객체의 인스턴스를 얻을 수 있기 때문이다)
+Connection객체를 직접 사용할 때는 result row들은 column레벨의 데이터만 가지고 있을 것이다.(매핑된 객체가 아니기 때문에)
+"""
+
+
+"""
+아래는 User entity에서 select()를 수행하여 
+User가 매핑된 테이블에서 select를 수행하는 Select를 생성한다.
+"""
+result = session.execute(select(User).order_by(User.id))
+
+"""
+ORM 엔티티들에 대해 select를 하면, 각각의 컬럼들의 series가 아니라,
+result로써 entity 자체가 리턴된다. (single element row임)
+즉, 결과로 반환되는 것은 각 행의 개별 열이 아니라, 행당 하나의 요소로서 엔터티 자체가 반환되는 것이다.
+
+아래를 보면 Result 객체는 row당 하나의 element를 가지고 있는 Row 객체를 반환하며, 이 element는 User객체를 포함한다.
+
+>>> result.all()
+[(User(id=1, name='spongebob', fullname='Spongebob Squarepants'),),
+ (User(id=2, name='sandy', fullname='Sandy Cheeks'),),
+ (User(id=3, name='patrick', fullname='Patrick Star'),),
+ (User(id=4, name='squidward', fullname='Squidward Tentacles'),),
+ (User(id=5, name='ehkrabs', fullname='Eugene H. Krabs'),)]
+
+
+ Result (Result 객체)
+├─ Row 1 (첫 번째 행)
+│   └─ User(id=1, name='spongebob', fullname='Spongebob Squarepants') (User 객체)
+├─ Row 2 (두 번째 행)
+│   └─ User(id=2, name='sandy', fullname='Sandy Cheeks') (User 객체)
+├─ Row 3 (세 번째 행)
+│   └─ User(id=3, name='patrick', fullname='Patrick Star') (User 객체)
+├─ Row 4 (네 번째 행)
+│   └─ User(id=4, name='squidward', fullname='Squidward Tentacles') (User 객체)
+└─ Row 5 (다섯 번째 행)
+    └─ User(id=5, name='ehkrabs', fullname='Eugene H. Krabs') (User 객체)
+
+"""
+
+
+"""
+하지만 ORM Entity를 포함하는 row 목록을 select할 때는 Row 오브젝트로 계속 생성하는 대신,
+ORM Entity를 다이렉트로 받는 것이 일반적이다.
+그럴려면 Session.execute() 메서드 대신 Session.scalars() 메서드를 사용한다. 
+이렇게 하면 ORM Enttiy를 다이렉트로 받는 ScalarResult 객체가 반환된다.
+"""
+session.scalars(select(User).order_by(User.id)).all()
+"""
+이렇게 하면 아래와 같이 다이렉트로 받을 수 있다. (SQL문은 동일)
+
+[User(id=1, name='spongebob', fullname='Spongebob Squarepants'),
+ User(id=2, name='sandy', fullname='Sandy Cheeks'),
+ User(id=3, name='patrick', fullname='Patrick Star'),
+ User(id=4, name='squidward', fullname='Squidward Tentacles'),
+ User(id=5, name='ehkrabs', fullname='Eugene H. Krabs')]
+
+
+Session.scalars()는 엄청 다른 건 없고 그냥
+Session.execut()를 호출해서 Result를 얻고 Result.scalars()를 호출하는 것과 똑같다.
+"""
+
+
+
+### 
