@@ -39,6 +39,7 @@ Session.commit()을 호출할지는 선택이며
 session으로 수행한 작업에 DB에 유지될 새 데이터가 포함된 경우에만 필요하다.
 SELECT만 호출하고 변경 사항을 쓸 필요가 없다면 commit()을 호출할 필요가 없다.
 """
+import email
 from random import seed
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -251,4 +252,116 @@ Session.execut()를 호출해서 Result를 얻고 Result.scalars()를 호출하�
 
 
 
-### 
+"""
+동시에 Multiple ORM Entitiy들을 selecting하기.
+"""
+stmt = select(User, Address).join(User.Addresses).order_by(User.id, Address.id)
+for row in session.execute(stmt):
+    print(f"{row.User.name} {row.Address.email_address}")
+
+"""
+이렇게 하면 SQL은 이렇게 날라간다.
+
+SELECT user_account.id, user_account.name, user_account.fullname,
+address.id AS id_1, address.user_id, address.email_address
+FROM user_account JOIN address ON user_account.id = address.user_id
+ORDER BY user_account.id, address.id
+[...] ()
+
+
+그리고 for문은 이 결과를 낸다.
+
+spongebob spongebob@sqlalchemy.org
+sandy sandy@sqlalchemy.org
+sandy squirrel@squirrelpower.org
+patrick pat999@aol.com
+squidward stentcl@sqlalchemy.org
+
+"""
+
+
+
+"""
+aliased()의 aliased.name를 써서 entity(Row안에 있는) 에 다른 이름을 할당할 수 있다.
+"""
+from sqlalchemy.orm import aliased
+user_cls = aliased(User, name="user_cls")
+email_clas = aliased(Address, name="email")
+stmt = (
+    select(user_cls, email_cls)
+    .join(user_cls.address.of_type(email_cls))
+    .order_by(user_cls.id, email_cls.id)
+)
+row = session.execute(stmt).first()
+print(f"{row.user_cls.name} {row.email.email_address}")
+
+# spongebob spongebob@sqlalchemy.org
+
+"""
+쿼리 자체도 이렇게 나가는듯
+SELECT user_cls.id, user_cls.name, user_cls.fullname,
+email.id AS id_1, email.user_id, email.email_address
+FROM user_account AS user_cls JOIN address AS email
+ON user_cls.id = email.user_id ORDER BY user_cls.id, email.id
+[...] ()
+
+
+"""
+
+
+"""
+각 Attribute를 셀렉트하게되면 Row 객체를 반환하지 entity(User, Adress같은..)를 반환하지 않는다잉
+Row객체는 SQLALchemy Core의 일부로 순수SQL쿼리나 Core API를 사용해서 나온 결과고 DB와 상호작용할 때 생성된다잉. 
+Entity는 ORM 매핑한 결과. ㅇㅋ?
+예를 들면, Core는 DB에 바로 SQL날려서 받고 ORM Entity는 모델클래스 만들어서 그거 가지고함~!
+"""
+result = session.execute(
+    select(User.name, Address.email_address)
+    .join(User.addresses)
+    .order_by(User.id, Address.id)
+)
+
+for row in result:
+    print(f"{row.name} {row.email_address}")
+
+"""
+spongebob  spongebob@sqlalchemy.org
+sandy  sandy@sqlalchemy.org
+sandy  squirrel@squirrelpower.org
+patrick  pat999@aol.com
+squidward  stentcl@sqlalchemy.org
+"""
+
+
+
+"""
+select한 Attributes들을 번들로 그룹핑할 수 있음
+Bundle을 이용하면 되는데 ORM-only이다잉
+커스텀 컬럼 그룹핑이나 경량화시켜서 보기 좋다.
+"""
+from sqlalchemy.orm import Bundle
+stmt = select(
+    Bundle("user", user.name, User.fullname),
+    Bundle("email", Address.email_address),
+).join_from(User, Address)
+
+for row in session.execute(stmt):
+    print(f"{row.user.name} {row.user.fullname} {row.email.email_address}")
+
+"""
+SQL 쿼리는 이렇게 날려짐
+
+SELECT user_account.name, user_account.fullname, address.email_address
+FROM user_account JOIN address ON user_account.id = address.user_id
+[...] ()
+
+for 결과는 이럼
+spongebob Spongebob Squarepants spongebob@sqlalchemy.org
+sandy Sandy Cheeks sandy@sqlalchemy.org
+sandy Sandy Cheeks squirrel@squirrelpower.org
+patrick Patrick Star pat999@aol.com
+squidward Squidward Tentacles stentcl@sqlalchemy.org
+"""
+
+
+# https://docs.sqlalchemy.org/en/20/orm/queryguide/select.html#selecting-orm-entities
