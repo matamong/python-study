@@ -187,3 +187,77 @@ class AsyncFileReaderWriter(AsyncContextManager):
 async with AsyncFileReaderWriter("example.txt", "w") as file:
     await file.write("Hello, Async World!") # async with 구문을 빠져나올 때 파일이 자동으로 닫힘
 ```
+
+<br><br><br>
+
+# Asyncio
+
+## Coroutine
+https://docs.python.org/3/glossary.html#term-coroutine <br>
+https://peps.python.org/pep-0492/ <br>
+
+- Python3.5에서 시작됐다.(2015년에 나왔다니 생각보다 최근이군)
+- 코루틴은 subroutines의 일반화 버전이다. subroutines는 한 포인트로 들어가고 다른 포인트로 나가는 방식이다. coroutine은 다양한 포인트에서 들어가고 나가고 다시 시작 될 수 있다. `async def` 와 함께 구현된다.
+
+Coroutine은 async/await 구문을 사용해서 사용하지만 단순히 이것만 쓴다고 되는 것은 아니다. <br>
+coroutine을 돌리기위해서 `asyncio`가 다음의 매커니즘을 제공한다. <br>
+
+1. 최상위 entry 포인트에서 `asyncio.run()`를 사용
+    ```python
+    >>> import asyncio
+
+    >>> async def main():
+    ...    print('hello')
+    ...    await asyncio.sleep(1)
+    ...    print('world')
+
+    >>> asyncio.run(main())
+
+    hello
+    world
+    ```
+2. Coroutine Awating
+
+등등...
+
+<br>
+
+## Await
+`await` 는 내부적으로 두 가지 동작을 한다.
+- `await` 에 딸려있는 코루틴 함수(Awaitable 객체)를 `Event Loop`에 실행해달라고 등록
+- 실행권을 `Event Loop`에게 줌
+
+이 동작을 하다가 `Event Loop`는 코루틴이 종료되거나 에러가 발생하면 실행권을 돌려준다. <br>
+즉, 비동기 작업을 정의하고 await를 사용하여 다른 작업의 완료를 기다리는 동안 실행을 중단하거나 양보하는데 사용하는 것이다.
+
+<br>
+
+## Event Loop
+https://docs.python.org/3/library/asyncio-eventloop.html <br>
+https://thinhdanggroup.github.io/event-loop-python/#understanding-the-event-loop-in-python <br>
+https://www.pythontutorial.net/python-concurrency/python-event-loop/ <br>
+
+### 날 계속 찾지마~ 내가 나중에 알려줄게!
+이벤트 루프는 싱글 스레드 안에서 다양한 작업들을 관리하기 위한 스케쥴링 매커니즘이다. <br>
+
+### Work Flow
+
+![](https://www.pythontutorial.net/wp-content/uploads/2022/07/python-event-loop.svg)
+
+- 작업 등록(register)
+  - 실행해야 할 작업이나 함수를 대기 중인 상태로 등록.
+  - 이 작업은 coroutines이라고도 알려져있다. 
+  - 이벤트 루프는 이벤트 큐라는 자료 구조를 가지고 이 작업들의 큐를 관리한다.
+  - e.g.
+    - 사용자의 클릭 이벤트, 네트워크 요청, 타이머 이벤트 등등...
+- 이벤트 감지
+  - 이벤트 루프는 계속해서 새로운 이벤트들을 체크한다.
+- 작업 실행
+  - 이벤트가 감지되면 이벤트 루프는 큐를 바라보고 작업을 실행한다.
+  - 여기서 중요한 것은!이벤트 루프는 오직 한 번에 한 작업만 실행할 수 있다는 것이다.
+  - 그러나, 작업은 일시정지되거나 재개되면서 비동기의 매직을 보여주는 것이다.
+- 실행 콜백
+  - 작업이 콜백함수와 연관되어있다면, 이벤트루프는 작업이 끝나고 콜백을 해준다.
+
+
+<br><br><br>
