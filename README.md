@@ -4,6 +4,84 @@
 ## 목차
 - **:arrow_right: [Middleware](https://github.com/matamong/django-study/tree/main/django_study/middleware_study)**
 
+<br><br>
+
+# UV
+## install
+### macOS/Linux
+```
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+### Windows(PowerShell)
+```
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+```
+## 사용법
+### 가상환경 생성
+```
+uv venv 
+```
+### 파이썬 설정
+- 파이썬도 자체적으로 관리 가능.
+```
+uv python install 3.10
+
+uv python list
+
+# Python 3.10으로 가상 환경 생성
+uv venv --python 3.10
+
+# 혹은 Python 3.12로 가상 환경 생성 (다른 디렉토리에서 또는 기존 .venv 삭제 후)
+# 기존 .venv를 삭제하고 새로 만들 경우:
+# rm -rf .venv
+# uv venv --python 3.12
+```
+```
+source .venv/bin/activate # uv 써도 이렇게 활성화해야하는 듯
+```
+- `.python-version` 만들어서 지정할 수 도 있음. (uv가 pyenv처럼 인식함)
+```
+echo "3.11" > .python-version
+```
+- 가상 환경을 명시적으로 활성화할 필요 없이 uv run을 사용하면 uv가 현재 프로젝트의 설정(즉, .venv와 연결된 Python 버전)에 맞춰 스크립트를 실행
+```
+uv run python matamong.py
+```
+### 패키지관리
+## `pyproject.toml`로 관리
+- 루트 디렉토리에 `pyproject.toml` 생성
+```
+# pyproject.toml
+[project]
+name = "your-project-name" # 프로젝트 이름을 적절히 변경
+version = "0.1.0"
+description = "A short description of your project"
+
+[build-system]
+requires = ["setuptools>=61.0"] # 또는 ["hatchling"] 등 사용하는 빌드 백엔드
+build-backend = "setuptools.build_meta" # 또는 "hatchling.build_meta" 등
+
+[tool.uv]
+# uv 관련 설정을 여기에 추가할 수 있습니다. (현재는 비워둬도 됨)
+```
+- `uv add` 로 인스톨
+```
+uv add llama-index-core
+```
+- 이 방식은 uv가 프로젝트 내 여러 독립적인 디렉토리를 하나의 패키지로 강제로 묶으려 하기 때문에 디렉토리가 많으면 복잡해짐. 그래서 본 프로젝트는 아래 `requirements.txt`방식을 사용
+## `requirements.txt`로 관리
+- 기존 `.venv` 방식 사용하면서 아래처럼 관리
+```
+uv pip install -r requirements.txt
+uv pip uninstall llama-index-core
+```
+```
+uv pip install llama-index-core
+```
+```
+uv pip freeze > requirements.txt
+```
 
 <br><br>
 
@@ -11,7 +89,7 @@
 https://docs.python.org/3/library/typing.html#typing.TypeVar <br>
 https://stackoverflow.com/questions/57551899/what-the-code-t-typevar-t-means-in-a-pyi-file <br>
 
-
+**Generic은 나중에 정해질 타입을 미리 임의로 정해놓는 것.**
 
 <br><br>
 
@@ -55,6 +133,9 @@ print(total_sum)
 - 제네릭 타입 자체는 어떤 데이터 특정한 데이터타입을 나타내지 않는다.
 - 함수 호출 시 전달되는 인자에 따라 동적으로 결정
 - 같은 type을 이용할 수 있게 하고싶을 때 type을 맞출 수 있다.
+- 즉, 이 예시에서는 lst, a, b가 모두 같은 타입이어야 한다고 TypeVar를 이용해서 명시한 것이다. 
+
+
 
 <br><br>
 
@@ -85,13 +166,15 @@ A = TypeVar('A', str, int)  # <-- 'A'는 str이거나 int여야함
 
 ```python
 from typing import TypeVar, Dict
-Key = TypeVar('Key')
-Value = TypeVar('Value')
+K = TypeVar('Key')
+V = TypeVar('Value')
 
 #`key`의 type은 `key_to_lookup`과 type이 맞아야한다.
 # 이렇게 사용하기 위해 TypeVar로 type을 맞추는 것이다.
-def lookup(input_dict: Dict[Key, Value], key_to_lookup: Key) -> Value:
+def lookup(input_dict: Dict[K, V], key_to_lookup: K) -> Value:
     return input_dict[key_to_loopup]
+
+# 즉,딕셔너리에서 값을 찾는데, key의 타입이 Dict의 키 타입과 같아야 한다는 보장인 것
 ```
 
 <br>
@@ -114,9 +197,9 @@ python3.12에서는 TypeVar에 대해서 새로운 문법이 생긴듯.
 # 이 코드는
 from typing import TypeVar
 
-_T = TypeVar("_T")
+T = TypeVar("T")
 
-def func(a: _T, b: _T) -> _T:
+def func(a: T, b: T) -> T:
     ...
 
 # 3.12에서 다음과 같다.
