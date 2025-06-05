@@ -2,10 +2,11 @@
 
 from abc import abstractmethod
 from enum import Enum
-from typing import Any, Callable, Generic, List, Optional, TypeVar
+from typing import Any, Callable, Generic, List, Optional, TypeVar, Union
 import uuid
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from sqlalchemy.ext.asyncio import AsyncEngine
 from llama_index.core.base.llms.types import (
     ChatMessage,
     ContentBlock,
@@ -20,6 +21,7 @@ from llama_index.core.storage.chat_store.sql import SQLAlchemyChatStore, Message
 # from llama_index.core.storage.chat_store import SimpleChatStore <- 이걸로 대체 가능
 
 from llama_index.core.utils import get_tokenizer
+from llama_index.core.async_utils import asyncio_run
 
 
 # Define type variable for memory block content
@@ -80,7 +82,9 @@ class BaseMemoryBlock(BaseModel, Generic[T]):
     
     메모:
     "메모리"블락 의 공통 구조와 동작을 정의한 추상 클래스.
+    넘치는 메시지는 전부 메모리블락으로 취급한다.
     데이터필드와 공통 인터페이스 ('aget', 'aput', 'atruncate')도 함께 정의되어있음.
+    즉, Memory Block은 저장된 대화 기록 또는 기타 정보들을 특정 방식으로 기억하거나, 가공하거나, 저장하거나, 꺼내오는 단위 모듈이다.
     """
     model_config = ConfigDict(arbitrary_types_allowed=True) # 지금 이 BaseModel의 ConfigDict를 설정
     # Pydantic은 기본적으로 int, str, float, list, dict, datetime 등 표준 타입이나 Pydantic 모델만을 유효한 필드 타입으로 인정함.
@@ -177,6 +181,11 @@ class BaseMemoryBlock(BaseModel, Generic[T]):
 class Memory(BaseMemory):
     """
     메시지 저장, 추론에 필요한 데이터 구성, 블록별 메모리 사용 조정.
+    아래의 역할을 하는거임:
+        - 대화가 쌓이면 토큰이 넘침
+        - 넘치는 메시지는 "기억 블록(memory block)"으로 넘어감
+        - 나중에 aget() 호출되면, 각 memory block에 저장된 걸 꺼냄
+        - 꺼낸 결과들은 chat history에 재삽입되거나 시스템 메시지로 들어감
     """
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -228,3 +237,153 @@ class Memory(BaseMemory):
         default_factory=generate_chat_store_key,
         description="The key to use for storing messages in the chat store.",
     )
+
+    @classmethod
+    def class_name(cls) -> str:
+        return "Memory"
+    
+    @model_validator(mode="before") # 객체 생성 전에 필드들을 검증/보완 오 이런 방식으로도 함 와오
+    @classmethod
+    def validate_memory(cls, values: dict) -> dict:
+        # Validate token limit
+        token_limit = values.get("token_limit", -1)
+        if token_limit < 1:
+            raise ValueError("Token limit must be set and grater than 0.")
+        
+        tokenizer_fn = values.get("tokenizer_fn")
+        if tokenizer_fn is None:
+            values["tokenizer_fn"] = get_tokenizer()
+        
+        if values.get("token_flush_size", -1) < 1:
+            values["token_flush_size"] = int(token_limit * 0.1)
+        elif values.get("token_flush_size", -1) > token_limit:
+            values["token_flush_size"] = int(token_limit * 0.1)
+        
+        # validate all blocks have unique names
+        block_names = [block.name for block in values.get("memory_blocks", [])]
+        if len(block_names) != len(set(block_names)):
+            raise ValueError("All memory blocks must have unique names.")
+    
+        return values
+    
+    # 클래스 메서드로 기본 설정값을 기반으로 Memory 객체를 생성 (이것도 validation 역할인 듯)
+    @classmethod
+    def from_defaults(  # type: ignore[override]
+        cls,
+        session_id: Optional[str] = None,
+        chat_history: Optional[List[ChatMessage]] = None,
+        token_limit: int = DEFAULT_TOKEN_LIMIT,
+        memory_blocks: Optional[List[BaseMemoryBlock[Any]]] = None,
+        tokenizer_fn: Optional[Callable[[str], List]] = None,
+        chat_history_token_ratio: float = 0.7,
+        token_flush_size: int = DEFAULT_FLUSH_SIZE,
+        memory_blocks_template: RichPromptTemplate = DEFAULT_MEMORY_BLOCKS_TEMPLATE,
+        insert_method: InsertMethod = InsertMethod.SYSTEM,
+        image_token_size_estimate: int = 256,
+        audio_token_size_estimate: int = 256,
+        # SQLAlchemyChatStore parameters
+        table_name: str = "llama_index_memory",
+        async_database_uri: Optional[str] = None,
+        async_engine: Optional[AsyncEngine] = None,
+    ) -> "Memory": # 문자열로 리턴타입을 정하는걸 "Forward Reference" 이라고함
+        """Initialize Memory"""
+        session_id = session_id or generate_chat_store_key()
+
+        # If not using the SQLAlchemyChatStore, provide an error
+        sql_store = SQLAlchemyChatStore(
+            table_name=table_name,
+            async_database_uri=async_database_uri,
+            async_engine=async_engine,
+        )
+
+        if chat_history is not None:
+            asyncio_run(sql_store.set_messages(session_id, chat_history))
+        
+        if token_flush_size > token_limit:
+            token_flush_size = int(token_limit * 0.7)
+        
+        """
+        Forward Reference:
+            - 타입 힌트를 사용할 때, 해당 타입이 아직 정의되지 않았거나, 자기 자신을 가리켜야 하는 경우, "클래스 이름"처럼 문자열로 타입을 감쌀 수 있도록 허용
+            - 예시 : 
+                class Node:
+                    def __init__(self, next_node: "Node"):
+                        self.next = next_node
+        
+            - 이 메서드는 클래스 메서드이고, cls를 통해 Memory 클래스를 생성하려고 하고있음.
+            - 이 시점에서 Memory 클래스 전체 정의가 아직 끝나지 않았기 때문에, Memory를 타입 힌트로 바로 쓰면 에러가 남.
+            - 그래서 "Memory"라는 **문자열로 감싸서 “얘는 나중에 해석해줘”**라고 Python에 말하는거임.
+            - *참고로 3.7부터는 "from __future__ import annotations" 을 import하면 문자열로 안 쓰고 걍 써도 됨
+                - 예시:
+                    from __future__ import annotations
+
+                    class Node:
+                        def __init__(self, next: Node):  # <- 문자열로 안 감싸도 됨!
+                            self.next = next
+        """
+        return cls(
+            token_limit=token_limit,
+            tokenizer_fn=tokenizer_fn or get_tokenizer(),
+            sql_store=sql_store,
+            session_id=session_id,
+            memory_blocks=memory_blocks or [],
+            chat_history_token_ratio=chat_history_token_ratio,
+            token_flush_size=token_flush_size,
+            memory_blocks_template=memory_blocks_template,
+            insert_method=insert_method,
+            image_token_size_estimate=image_token_size_estimate,
+            audio_token_size_estimate=audio_token_size_estimate,
+        )
+    
+    def _estimate_token_count(
+            self,
+            message_or_blocks: Union[
+                str, ChatMessage, List[ChatMessage], List[ContentBlock]
+            ],
+    ) -> int:
+        """Estimate token count for a message."""
+        token_count = 0
+
+        # Normalize the input to a list of ContentBlocks
+        if isinstance(message_or_blocks, ChatMessage):
+            blocks = message_or_blocks.blocks
+
+            # Estimate the token count for the additional kwargs
+            if message_or_blocks.additional_kwargs:
+                token_count += len(
+                    self.tokenizer_fn(str(message_or_blocks.additional_kwargs))
+                )
+        elif isinstance(message_or_blocks, List):
+            # Type narrow the list (타입 좁히기...실제 타입을 확인!)
+            messages: List[ChatMessage] = []
+            content_blocks: List[
+                Union[TextBlock, ImageBlock, AudioBlock, DocumentBlock]
+            ] = []
+            # TODO: 여기서부터
+        return 0
+
+
+
+    async def aget(self, **block_kwargs: Any) -> List[ChatMessage]: # type: ignore[override]
+        """
+        Get messages with memory blocks included (async).
+            - Memory 객체는 내부에 여러 memory_blocks를 갖고 있음
+            - 각 블록은 자신만의 방식으로 기억을 저장하고 있음 (.aput()으로 과거에 저장했음)
+            - 지금은 aget()이므로, 각 블록에게 “기억 꺼내줘” 요청을 보냄
+        """
+        # 1. 챗 히스토리 가져오고
+        chat_history = await self.sql_store.get_messages(
+            self.session_id, status=MessageStatus.ACTIVE
+        )
+        # 2. 챗 히스토리 토큰 계산하고 (토큰 제한 떔에)
+        chat_history_tokens = sum(
+            self._estimate_token_count(message) for message in chat_history
+        )
+        # 3. 메모리 블록 별로 얻은 콘텐츠를 꺼냄.
+        # 4. 메모리 블록 토큰 계산 (토큰 제한 땜에)
+        # 5. 필요하면 truncate
+        # 6. 메모리 블락에서 꺼낸걸 "어떤 건 템플릿(요약, 지시)에 넣고", "어떤 건 바로 메시지(채팅)로 쓸 수 있는지" 분리
+        # 7. 템플릿이 있으면 템플릿 내용을 채팅 매세지로 만들어야함.
+        return None
+    
+        
