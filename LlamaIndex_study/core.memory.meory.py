@@ -2,7 +2,7 @@
 
 from abc import abstractmethod
 from enum import Enum
-from typing import Any, Callable, Generic, List, Optional, TypeVar, Union
+from typing import Any, Callable, Dict, Generic, List, Optional, Tuple, TypeVar, Union, cast
 import uuid
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -85,6 +85,37 @@ class BaseMemoryBlock(BaseModel, Generic[T]):
     넘치는 메시지는 전부 메모리블락으로 취급한다.
     데이터필드와 공통 인터페이스 ('aget', 'aput', 'atruncate')도 함께 정의되어있음.
     즉, Memory Block은 저장된 대화 기록 또는 기타 정보들을 특정 방식으로 기억하거나, 가공하거나, 저장하거나, 꺼내오는 단위 모듈이다.
+
+    아래처럼 구현될 것 임.:
+        class SummaryMemoryBlock(BaseMemoryBlock[str]):
+            async def _aget(self, messages: List[ChatMessage], **kwargs) -> str:
+                return summarize_messages(messages)  # 문자열 요약
+
+            async def _aput(self, messages: List[ChatMessage]) -> None:
+                store_in_summary_vector_db(messages)
+
+            async def atruncate(self, content: str, tokens_to_truncate: int) -> Optional[str]:
+                return truncate_text(content, tokens_to_truncate)
+        
+        class LongTermMemoryBlock(BaseMemoryBlock[List[ChatMessage]]):
+            async def _aget(self, messages: List[ChatMessage], **kwargs) -> List[ChatMessage]:
+                return self.retrieve_relevant_past_turns(messages)
+
+            async def _aput(self, messages: List[ChatMessage]) -> None:
+                self.store(messages)
+
+    즉,
+    BaseMemoryBlock은 다음과 같은 확장 지점을 열어둔 추상 클래스.
+        aput(messages: List[ChatMessage]):
+        → 이 메시지를 어디다 저장할지? 어떻게 기억할지?
+        → 내가 정함! (벡터 DB든, Redis든, JSON 파일이든 OK)
+
+        aget(...) -> T:
+        → 저장한 기억을 어떤 방식으로 꺼낼지?
+        → 검색/필터링/리트리벌 등 자유롭게 구현 가능
+
+        atruncate(...):
+        → 길면 어떻게 줄일지? 버릴지? 잘라낼지?
     """
     model_config = ConfigDict(arbitrary_types_allowed=True) # 지금 이 BaseModel의 ConfigDict를 설정
     # Pydantic은 기본적으로 int, str, float, list, dict, datetime 등 표준 타입이나 Pydantic 모델만을 유효한 필드 타입으로 인정함.
@@ -266,7 +297,7 @@ class Memory(BaseMemory):
     
         return values
     
-    # 클래스 메서드로 기본 설정값을 기반으로 Memory 객체를 생성 (이것도 validation 역할인 듯)
+    # 클래스 메서드로 기본 설정값을 기반으로 Memory 객체를 생성 (사용자 정의 클래스로 만드는 느낌)
     @classmethod
     def from_defaults(  # type: ignore[override]
         cls,
@@ -359,10 +390,275 @@ class Memory(BaseMemory):
             content_blocks: List[
                 Union[TextBlock, ImageBlock, AudioBlock, DocumentBlock]
             ] = []
-            # TODO: 여기서부터
-        return 0
+            
+            if all(isinstance(item, ChatMessage) for item in message_or_blocks):
+                messages = cast(List[ChatMessage], message_or_blocks) 
+                """
+                cast: message_or_blocks가 실제로는 List[ChatMessage]라고 타입검사에게 말해주는거임 (IDE를 위해서)                 
+                """
 
+                blocks = []
+                for msg in messages:
+                    blocks.extend(msg.blocks)
+                
+                # Estimate the token count for the additional kwargs
+                token_count += sum(
+                    len(self.tokenizer_fn(str(msg.additional_kwargs)))
+                    for msg in messages
+                    if msg.additional_kwargs
+                )
+            elif all(
+                isinstance(item, (TextBlock, ImageBlock, AudioBlock, DocumentBlock))
+                for item in message_or_blocks
+            ):
+                content_blocks = cast(
+                    List[Union[TextBlock, ImageBlock, AudioBlock, DocumentBlock]],
+                    message_or_blocks,
+                )
+                blocks = content_blocks
+            else:
+                raise ValueError(f"Invalid message type: {type(message_or_blocks)}")
+        elif isinstance(message_or_blocks, str):
+            blocks = [TextBlock(text=message_or_blocks)]
+        else:
+            raise ValueError(f"Invalid message type: {type(message_or_blocks)}")
 
+        # block 유형별로 토큰 수를 추정해서 합산함.
+        # 텍스트는 tokenizer로 실제 길이 계산
+        # 이미지나 오디오는 설정된 추정값을 사용
+        for block in blocks:
+            if isinstance(block, TextBlock):
+                token_count += len(self.tokenizer_fn(block.text))
+            elif isinstance(block, ImageBlock):
+                token_count += self.image_token_size_estimate
+            elif isinstance(block, AudioBlock):
+                token_count += self.audio_token_size_estimate
+        
+        return token_count
+
+    async def _get_memory_blocks_content(
+        self, chat_history: List[ChatMessage], **block_kwargs: Any
+    ) -> Dict[str, Any]:
+        """
+        Get content from memory blocks in priority order
+
+        self.memory_blocks 리스트에 있는 모든 memory block에 대해 aget()을 호출해서,
+        그 결과(기억된 내용)를 모아서 Dict[str, Any] 형태로 리턴
+        """
+        content_per_memory_block: Dict[str, Any] = {}
+
+        # Process memory blocks in priority order
+        for memory_block in sorted(self.memory_blocks, key=lambda x: -x.priority):
+            content = await memory_block.aget(
+                chat_history, session_id=self.session_id, **block_kwargs
+            )
+
+            # Handle different return types from memory blocks
+            if content and isinstance(content, list):
+                # Memory block returned content blocks
+                content_per_memory_block[memory_block.name] = content
+            elif content and isinstance(content, str):
+                # Memory block returned a string
+                content_per_memory_block[memory_block.name] = content
+            elif not content:
+                continue
+            else:
+                raise ValueError(
+                    f"Invalid content type received from memory block {memory_block.name}: {type(content)}"
+                )
+        return content_per_memory_block
+
+    async def _truncate_memory_blocks(
+        self,
+        content_per_memory_block: Dict[str, Any],
+        memory_blocks_tokens: int,
+        chat_history_tokens: int,
+    ) -> Dict[str, Any]:
+        """Truncate memory blocks if total token count exceeds limit."""
+        if memory_blocks_tokens + chat_history_tokens <= self.token_limit:
+            return content_per_memory_block
+        
+        tokens_to_truncate = (
+            memory_blocks_tokens + chat_history_tokens - self.token_limit
+        )
+        truncated_content = content_per_memory_block.copy()
+
+        # Truncate memory blocks based on priority
+        for memory_block in sorted(
+            self.memory_blocks, key=lambda x: x.priority
+        ):  # Lower priority first
+            # Skip memory blocks with priority 0, they should never be truncated
+            if memory_block.priority == 0:
+                continue
+            
+            if tokens_to_truncate <= 0:
+                break
+
+            # Truncate content and measure tokens saved
+            content = truncated_content.get(memory_block.name, [])
+
+            truncated_block_content = await memory_block.atruncate(
+                content, tokens_to_truncate
+            )
+
+            # Calculate tokens saved
+            original_tokens = self._estimate_token_count(content)
+
+            if truncated_block_content is None:
+                new_tokens = 0
+            else:
+                new_tokens = self._estimate_token_count(truncated_block_content)
+            
+            tokens_saved = original_tokens - new_tokens
+            tokens_to_truncate -= tokens_saved
+
+            if truncated_block_content is None:
+                truncated_content[memory_block.name] = []
+            else:
+                truncated_content[memory_block.name] = truncated_block_content
+            
+        # handle case whre we still have tokens to truncate
+        # just remove the blocks starting from the least priority
+        for memory_block in sorted(self.memory_blocks, key=lambda x: x.priority):
+            if memory_block.priority == 0:
+                continue
+
+            if tokens_to_truncate <= 0:
+                break
+
+            # Truncate content and measure tokens saved
+            content = truncated_content.pop(memory_block.name)
+            tokens_to_truncate -= self._estimate_token_count(content)
+        
+        return truncated_content
+    
+    async def _format_memory_blocks(
+        self, content_per_memory_block: Dict[str, Any]
+    ) -> Tuple[List[Tuple[str, List[ContentBlock]]], List[ChatMessage]]:
+        """
+            Format memory blocks content into template data and chat messages.
+            
+            content_per_memory_block 는 아래처럼 생겼을 것.
+            {
+                "summary": "요약된 내용",
+                "retrieval": [ChatMessage(...), ChatMessage(...)],
+                "file_memory": [TextBlock(...), ImageBlock(...)]
+            }
+        """
+        memory_blocks_data: List[Tuple[str, List[ContentBlock]]] = [] # 템플릿
+        chat_message_data: List[ChatMessage] = [] # 그대로 채팅 히스토리에 들어갈 리스트
+
+        for block in self.memory_blocks:
+            if block.name in content_per_memory_block:
+                content = content_per_memory_block[block.name]
+
+                # Skip empty memory blocks
+                if not content:
+                    continue
+
+                if (
+                    isinstance(content, list)
+                    and content
+                    and isinstance(content[0], ChatMessage)
+                ):
+                    # 이건 이미 메시지 형태로 만들어진 것 → 직접 붙이기만 하면 됨
+                    chat_message_data.extend(content)
+                elif isinstance(content, str):
+                    # 요약 문자열 등 → TextBlock으로 감싸고, 템플릿용으로 넘김
+                    memory_blocks_data.append((block.name, [TextBlock(text=content)]))
+                else:
+                    # 이미지/문서 블록 등, 이미 ContentBlock 형태로 구성된 데이터
+                    # 이것도 템플릿으로 넘김
+                    memory_blocks_data.append((block.name, content))
+
+        return memory_blocks_data, chat_message_data
+
+    def _insert_memory_content(
+        self,
+        chat_history: List[ChatMessage], # 기존 대화 내용
+        memory_content: List[ContentBlock], # 템플릿 기반 memory block이 생성한 요약/지식
+        chat_message_data: List[ChatMessage], # memory block이 직접 생성한 메시지들
+    ) -> List[ChatMessage]:
+        """
+        Insert memory content into chat history based on insert method.
+        메모리 블록에서 나온 기억들(memory blocks) 을
+        기존 대화(chat history)에 적절하게 삽입해서
+        최종 채팅 히스토리 결과 리스트를 만들어줌.
+        
+        아래처럼 들어오면:
+            chat_history = [
+                ChatMessage(role="user", content="안녕"),
+                ChatMessage(role="assistant", content="반가워요!"),
+            ]
+            memory_content = [
+                TextBlock(text="이전 대화 요약: ..."),
+            ]
+            chat_message_data = [
+                ChatMessage(role="assistant", content="이전 대화를 기반으로 이런 걸 기억하고 있어요."),
+            ]
+
+        이렇게 바꿈:
+            [
+                ChatMessage(role="system", blocks=[TextBlock(...) memory_content]),
+                ChatMessage(role="assistant", content="이전 대화를 기반으로 이런 걸 기억하고 있어요."),
+                ChatMessage(role="user", content="안녕"),
+                ChatMessage(role="assistant", content="반가워요!"),
+            ]
+        """
+        result = chat_history.copy()
+
+        # Process chat messages
+        if chat_message_data:
+            result = [*chat_message_data, *result]
+            """
+            result = [
+                ChatMessage(role="user", content="안녕"),
+                ChatMessage(role="assistant", content="안녕하세요!"),
+                ChatMessage(role="system", blocks=[...]),
+            ]
+            """
+        
+        # Process template-based memory blocks
+        if memory_content:
+            if self.insert_method == InsertMethod.SYSTEM:
+                """
+                기억(memory block 내용)을 채팅 기록(chat history)에 삽입하려고 하는데,
+                그걸 삽입할 "system 메시지"가 이미 있는지 먼저 확인
+                """
+                # Find system message or create a new one
+                system_idx = next(
+                    (i for i, msg in enumerate(result) if msg.role == "system"), None
+                )
+
+                if system_idx is not None:
+                    # Update existing system message
+                    result[system_idx].blocks = [
+                        *memory_content,
+                        *result[system_idx].blocks
+                    ]
+                else:
+                    # Create new system message at the beginning
+                    result.insert(0, ChatMessage(role="system", blocks=memory_content))
+            elif self.insert_method == InsertMethod.USER:
+                # Find the latest user message
+                session_idx = next(
+                    (i for i, msg in enumerate(reversed(result)) if msg.role == "user"),
+                    None,
+                ) 
+                # reversed 해서 마지막 result에 삽입할거임.
+
+                if session_idx is not None:
+                    # Get actual index (since we enumerated in reversed)
+                    actual_idx = len(result) - 1 - session_idx
+                    # Updated existing user message
+                    result[actual_idx].blocks = [
+                        *memory_content,
+                        *result[actual_idx].blocks,
+                    ]
+                else:
+                    result.append(ChatMessage(role="user", blocks=memory_content))
+        
+        return result
 
     async def aget(self, **block_kwargs: Any) -> List[ChatMessage]: # type: ignore[override]
         """
@@ -380,10 +676,39 @@ class Memory(BaseMemory):
             self._estimate_token_count(message) for message in chat_history
         )
         # 3. 메모리 블록 별로 얻은 콘텐츠를 꺼냄.
+        content_per_memory_block = await self._get_memory_blocks_content(
+            chat_history, **block_kwargs
+        )
         # 4. 메모리 블록 토큰 계산 (토큰 제한 땜에)
+        memory_blocks_tokens = sum(
+            self._estimate_token_count(content) 
+            for content in content_per_memory_block.values()
+        )
         # 5. 필요하면 truncate
+        truncated_content = await self._truncate_memory_blocks(
+            content_per_memory_block, memory_blocks_tokens, chat_history_tokens
+        )
         # 6. 메모리 블락에서 꺼낸걸 "어떤 건 템플릿(요약, 지시)에 넣고", "어떤 건 바로 메시지(채팅)로 쓸 수 있는지" 분리
+        memory_blocks_data, chat_message_data = await self._format_memory_blocks(
+            truncated_content
+        )
+
         # 7. 템플릿이 있으면 템플릿 내용을 채팅 매세지로 만들어야함.
-        return None
+        memory_content = []
+        if memory_blocks_data:
+            memory_block_messages = self.memory_blocks_template.format_messages(
+                memory_blocks=memory_blocks_data
+            )
+            memory_content = (
+                memory_block_messages[0].blocks if memory_block_messages else []
+            )
+            # memory_block_messages의 첫번째를 쓴 memory_content라는 이 리스트는 최종적으로 system 메시지나 user 메시지에 삽입
+
+        return self._insert_memory_content(
+            chat_history, memory_content, chat_message_data
+        )
     
+    async def aput(self, message: ChatMessage) -> None:
+        # TODO: 여기서부터
+        pass
         
