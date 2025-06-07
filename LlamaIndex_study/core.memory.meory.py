@@ -1,6 +1,26 @@
 # https://github.com/run-llama/llama_index/blob/main/llama-index-core/llama_index/core/memory/memory.py
 
+
+"""
+메시지 시스템 구조
+
+1. 단기 메모리 (FIFO Queue)
+→ 최근 대화를 chat_store에 계속 쌓음.
+→ session_id에 연결된 채팅 로그가 저장됨.
+
+2. 장기 메모리 (Memory Blocks)
+→ 단기 메모리가 너무 많아져서 정리해야 할 때,
+→ 오래된 메시지를 꺼내서 이 memory block들에 "기억"으로 넘겨줌.
+
+
+알야할 개념
+Memory block : 기억을 저장하거나 꺼내는 개별적인 기억 저장소 모듈. 여러 개의 Memory blcok을 조합해서 하나의 Memory 객체를 구성함.
+Waterfall : 메모리 용량이 가득 차면 오래된 메시지를 흘려보내고, 그 메시지들을 다양한 memory block으로 흘려보내 저장하는 흐름 ('_manage_queue' 함수에서 구현됨)
+"""
+
+
 from abc import abstractmethod
+import asyncio
 from enum import Enum
 from typing import Any, Callable, Dict, Generic, List, Optional, Tuple, TypeVar, Union, cast
 import uuid
@@ -708,7 +728,236 @@ class Memory(BaseMemory):
             chat_history, memory_content, chat_message_data
         )
     
-    async def aput(self, message: ChatMessage) -> None:
-        # TODO: 여기서부터
-        pass
+    async def _manage_queue(self) -> None:
+        """
+        Manage the FIFO queue.
+        기억이 넘치면 기억을 흘려보내고 저장소를 저장
+
+        1. 현재 저장된 메시지의 총 토큰 수 확인
+        2. 만약 token_limit을 초과하면:
+            - 오래된 메시지부터 꺼냄
+            - 메시지 덩어리 단위로 정리 (한 턴 단위로)
+            - 꺼낸 메시지를 각 memory_block.aput()으로 넘겨줌 (장기기억에 저장)
+            - FIFO 큐에서 아카이브 처리
+        """
+        # Calculate if we need to waterfall
+        current_queue = await self.sql_store.get_messages(
+            self.session_id, status=MessageStatus.ACTIVE
+        )
+
+        # If current queue is empty, return
+        if not current_queue:
+            return
         
+        tokens_in_current_queue = sum(
+            self._estimate_token_count(message) for message in current_queue
+        )
+
+        # If we're over the oken limit, initiate waterfall
+        token_limit = self.token_limit * self.chat_history_token_ratio
+        if tokens_in_current_queue > token_limit:
+            # Process from oldest to newst, but efficiently with pop() operations
+            reversed_queue = current_queue[::-1]  # newest first, oldest last
+            
+            # Calculate approximate number of messages to remove
+            tokens_to_remove = tokens_in_current_queue - token_limit
+
+            while tokens_to_remove > 0:
+                # If only one message left, keep it regardless of token count
+                if len(reversed_queue) <= 1:
+                    break
+
+                # Collect messages to flush (up to flush size)
+                messages_to_flush = []
+                flushed_tokens = 0
+
+                # Remove oldest messages (from end of reversed list) until reaching flush size
+                while (
+                    flushed_tokens < self.token_flush_size
+                    and reversed_queue
+                    and len(reversed_queue) > 1
+                ):
+                    message = reversed_queue.pop()
+                    messages_to_flush.append(message)
+                    flushed_tokens += self._estimate_token_count(message)
+                
+                # Ensure we keep at least one message
+                if not reversed_queue and messages_to_flush:
+                    reversed_queue.append(messages_to_flush.pop())
+                
+                # We need to maintain conversation integrity
+                # Messages should be removed in complete conversation turns
+                chronological_view = reversed_queue[::-1] # View in chronological order
+                """
+                메시지를 자르더라도 대화의 흐름은 깨지지 않아야 하기 때문에, 대화턴을 유지해야함.
+                
+                예를 들어:
+                    chat_history = [
+                        ChatMessage(role="user", content="어제 뭐라 했지?"),          # ⬅️ 오래됨
+                        ChatMessage(role="assistant", content="어제는 이런 얘기 했어요."),
+                        ChatMessage(role="user", content="그거 기억나?"),
+                        ChatMessage(role="assistant", content="당연하죠."),
+                    ]
+                이렇게 있는데 flush할 때 아래처럼 자를 수 있음
+                    남는 메시지 = [
+                        ChatMessage(role="assistant", content="어제는 이런 얘기 했어요."),  # ❌
+                        ChatMessage(role="user", content="그거 기억나?"),
+                        ChatMessage(role="assistant", content="당연하죠."),
+                    ]
+                
+                    그래서 최소한 user->assistant 는 하나의 쌍 단위로 자르려고 함.
+                
+                그렇기 땜시롱
+                1. flush할 메시지를 토큰 수로 쭉 빼놓고,
+                2. flush가 끝난 후 남은 메시지들에서 맨 앞에 있는게 user 메시지인지 맨 뒤에 있는게 asssitant인지 확인해서 흐름이 자연스러운지 보려는 것.
+                """
+                if chronological_view:
+                    # Keep removing messages until first remaining message is from user
+                    # This ensures we start with a user message
+                    """
+                    다시 뒤집은걸 가지고 user 메시지가 나올 때까지 앞에서부터 메시지를 더 flush(제거)
+                    """
+                    while(
+                        chronological_view
+                        and chronological_view[0].role != "user"
+                        and len(reversed_queue) > 1
+                    ):
+                        if reversed_queue:
+                            messages_to_flush.append(reversed_queue.pop())
+                            chronological_view = reversed_queue[::-1]
+                        else:
+                            break
+                    
+                    # If we end up with an empty queue, keep at least one full conversation turn
+                    if not reversed_queue and messages_to_flush:
+                        # Find the most recent complete conversation turn
+                        # (user -> assistant/tool sequence) in messages_to_flush
+                        found_user = False
+                        turn_messages: List[ChatMessage] = []
+
+                        # Go through messages_to_flush in reverse (newest first)
+                        for msg in reversed(messages_to_flush): # 가장 최근 대화 턴
+                            if msg.role == "user" and not found_user:
+                                """
+                                user 메시지 만나면 여기서부터 대화 턴 시작
+                                """
+                                found_user = True
+                                turn_messages.insert(0, msg)
+                            elif found_user:
+                                """
+                                user 이후의 메시지들(assistant/tool)을 앞에 추가
+                                """
+                                turn_messages.insert(0, msg)
+                            else:
+                                break
+                        # If we found a complete turn, keep it
+                        if found_user and turn_messages:
+                            # Remove these messages from messages_to_flush
+                            for msg in turn_messages:
+                                messages_to_flush.remove(msg)
+                            # Add them back to the queue
+                            reversed_queue = turn_messages[::-1] + reversed_queue
+                            """
+                            다시 원래 메모리로 돌려놓기
+                            """
+                
+                # Archive the flushed messages 
+                if messages_to_flush:
+                    await self.sql_store.archive_oldest_messages(
+                        self.session_id, n=len(messages_to_flush)
+                    )
+
+                    # Waterfall the flushed messages to meemory blocks
+                    await asyncio.gather(
+                        *[
+                            block.aput(
+                                messages_to_flush,
+                                from_short_term_memory=True,
+                                session_id=self.session_id,
+                            )
+                            for block in self.memory_blocks
+                        ]
+                    )
+                    """
+                    asyncio.gather는 여러 비동기 작업(coroutine)을 동시에 실행시켜주는 비동기 태스크 병렬 처리 함수
+                    여러 memory block (예: 벡터DB, 장기기억, 요약 블럭 등)을 한꺼번에 받아오기
+                    """
+                
+                # Recalculate remaining tokens
+                chronological_view = reversed_queue[::-1]
+                tokens_in_current_queue = sum(
+                    self._estimate_token_count(message)
+                    for message in chronological_view
+                )
+                tokens_to_remove = tokens_in_current_queue - token_limit
+
+                if not messages_to_flush:
+                    break
+
+    
+    async def aput(self, message: ChatMessage) -> None:
+        """
+        Add a message to the chat store and process waterfall logic if needed.
+
+        단일 메시지일 때
+        새로운 메시지를 단기 메모리에 저장. 
+        단기 메모리가 넘치면 오래된 기억을 memory block으로 흘려보냄
+        """
+        # Add the message to the chat store
+        await self.sql_store.add_message(
+            self.session_id, message, status=MessageStatus.ACTIVE # MessageStatus는 ACTIVE, ARCHIVE가 있음. active는 Message is in the active FIFO queue 이 상태.
+        )
+
+        # Ensure the active queue is managed
+        await self._manage_queue() # 워터폴 로직 자동으로 발동시키기 위함.
+    
+    async def aput_messages(self, messages: List[ChatMessage]) -> None:
+        """
+        Add a list of messages to the chat store and process waterfall logic if needed.
+        여러 메시지일 때. aput과 비슷함.
+        """
+        # Add the messages to the chat store
+        await self.sql_store.add_messages(
+            self.session_id, messages, status=MessageStatus.ACTIVE
+        )
+
+        # Ensure the active queue is managed
+        await self._manage_queue()
+
+    async def aset(self, messages: List[ChatMessage]) -> None:
+        """Set the chat history."""
+        await self.sql_store.set_messages(
+            self.session_id, messages, status=MessageStatus.ACTIVE
+        )
+
+    async def aget_all(
+        self, status: Optional[MessageStatus] = None
+    ) -> List[ChatMessage]:
+        """Get all messages."""
+        return await self.sql_store.get_messages(self.session_id, status=status)
+
+    async def areset(self, status: Optional[MessageStatus] = None) -> None:
+        """Reset the memory."""
+        await self.sql_store.delete_messages(self.session_id, status=status)
+
+    # ---- Sync method wrappers ----
+
+    def get(self, **block_kwargs: Any) -> List[ChatMessage]:  # type: ignore[override]
+        """Get messages with memory blocks included."""
+        return asyncio_run(self.aget(**block_kwargs))
+
+    def get_all(self, status: Optional[MessageStatus] = None) -> List[ChatMessage]:
+        """Get all messages."""
+        return asyncio_run(self.aget_all(status=status))
+
+    def put(self, message: ChatMessage) -> None:
+        """Add a message to the chat store and process waterfall logic if needed."""
+        return asyncio_run(self.aput(message))
+
+    def set(self, messages: List[ChatMessage]) -> None:
+        """Set the chat history."""
+        return asyncio_run(self.aset(messages))
+
+    def reset(self) -> None:
+        """Reset the memory."""
+        return asyncio_run(self.areset())
